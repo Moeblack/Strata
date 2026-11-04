@@ -2182,13 +2182,18 @@ struct Model::Impl {
         }
         return v;
     }
+    // Dense GGUF matrices split output rows evenly; keep loading and vocabulary ranges on the same rule.
+    static bool dense_gguf_matrix(const Tensor* t) {
+        return t != nullptr && (t->dtype == "BF16" || t->dtype == "Q8_0" || t->dtype == "Q4_K" ||
+                                t->dtype == "Q5_K" || t->dtype == "Q6_K");
+    }
     // an EXL3 matrix onto the device: whole, or (np > 1) part `part` of its columns (cols) or of its rows - a standalone
     // matrix of its own (the rotations' 128-blocks stay whole)
     // rot keeps EXL3's split128 behavior. Optional explicit slices are only for GGUF shared FFNs,
     // whose offsets and widths must match the routed expert rather than be independently divided.
     bool mat(Dev& d, const std::string& pre, x3::Mat& m, std::string& err, size_t* acct, int part = 0, int np = 1,
              bool cols = true, int rot = 0, int slice0 = -1, int slicen = 0) {
-        if (const Tensor* tw = pk.get(pre + ".weight"); tw != nullptr && (tw->dtype == "BF16" || tw->dtype == "Q8_0" || tw->dtype == "Q4_K" || tw->dtype == "Q5_K" || tw->dtype == "Q6_K"))
+        if (const Tensor* tw = pk.get(pre + ".weight"); dense_gguf_matrix(tw))
             return mat_bf16(d, pre, *tw, m, err, acct, part, np, cols, slice0, slicen);
         const Tensor* tr = pk.get(pre + ".trellis");
         const Tensor* su = pk.get(pre + ".suh");
@@ -5246,6 +5251,13 @@ struct Model::Impl {
             const int hn = head_nm();
             if (!mat(d, "head", d.head, err, acct, d.mi, hn, true) || !f32(d, "norm.weight", d.norm_w, err, acct, (size_t) g.dim))
                 return false;
+            int v0 = 0, vn = 0;
+            head_cols(hn, d.mi, v0, vn);
+            if (d.head.n != vn) {
+                err = "head: member " + std::to_string(d.mi) + " loaded " + std::to_string(d.head.n) +
+                      " rows, expected vocabulary slice [" + std::to_string(v0) + ", " + std::to_string(v0 + vn) + ")";
+                return false;
+            }
             if (g.n_mtp > 0 && !f32(d, "mtp." + std::to_string(g.n_mtp - 1) + ".norm.weight", d.d_norm, err, acct, (size_t) g.dim))
                 return false;
             if (!dalloc(d, d.logits_part, (size_t) kWin * ((g.vocab / 128 + hn - 1) / hn * 128), err)) return false;
@@ -13427,11 +13439,11 @@ struct Model::Impl {
     }
 
     int head_nm() const { return (int) groups[(size_t) devs[(size_t) head_dev].grp].mem.size(); }
-    // the head's columns on member mi of its group of nm: an EXL3 head's split128 of the vocabulary (mat's), a GGUF's
-    // BF16 / Q8_0 head's even shares (mat_bf16's) - head_share's, its gather's and the markov steps' rows
+    // The head's columns on member mi: EXL3 uses mat's split128; all supported dense GGUF types
+    // use mat_bf16/mat_gg's even output-row shares, including the gather and markov head ranges.
     void head_cols(int nm, int mi, int& v0, int& vn) const {
         const Tensor* tw = pk.get("head.weight");
-        if (tw != nullptr && (tw->dtype == "BF16" || tw->dtype == "Q8_0")) {
+        if (dense_gguf_matrix(tw)) {
             vn = g.vocab / nm;
             v0 = mi * vn;
         } else
