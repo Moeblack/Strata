@@ -153,13 +153,17 @@ void split128(int whole, int np, int p, int& off, int& n, int rot = 0) {
     n = 128 * blocks(p);
 }
 
-// GGUF FFNs share whole quantization/alignment blocks, with the extra blocks on the first members.
-// No rotation: routed and shared weights use this same [off, off + n) range on every layer.
-bool split_blocks(int whole, int np, int p, int block, int& off, int& n) {
+// GGUF FFNs share whole quantization/alignment blocks. Extra blocks rotate from member rot;
+// offsets are prefix sums in physical member order, so routed and shared slices cover the FFN once.
+bool split_blocks(int whole, int np, int p, int block, int& off, int& n, int rot = 0) {
     if (block <= 0 || np <= 0 || p < 0 || p >= np || whole % block != 0 || whole / block < np) return false;
     const int b = whole / block, q = b / np, r = b % np;
-    off = (p * q + std::min(p, r)) * block;
-    n = (q + (p < r ? 1 : 0)) * block;
+    rot = (rot % np + np) % np;
+    auto blocks = [&](int i) { return q + ((i - rot + np) % np < r ? 1 : 0); };
+    int at = 0;
+    for (int i = 0; i < p; ++i) at += blocks(i);
+    off = at * block;
+    n = blocks(p) * block;
     return true;
 }
 
@@ -3175,8 +3179,8 @@ struct Model::Impl {
                 c.dev = groups[(size_t) l.grp].mem[(size_t) m];
                 l.mates.push_back(std::move(c));
             }
-            // EXL3 keeps its rotated 128-block shares; GGUF uses common quantization/alignment
-            // blocks, with any extra blocks on the first members, also used by the shared expert.
+            // EXL3 rotates its 128-block shares; GGUF rotates common quantization/alignment
+            // blocks by the same layer index. The shared expert uses these same member ranges.
             for (int m = 0; m < l.nm; ++m) {
                 Layer& x = member(l, m);
                 const int ha = m - (l.nm - na);   // (its place among the members with heads)
@@ -3185,7 +3189,7 @@ struct Model::Impl {
                 x.ogn = ha < 0 ? 0 : g.o_groups / na;
                 x.og0 = ha < 0 ? 0 : ha * x.ogn;
                 if (gguf_x)
-                    split_blocks(g.ff, l.nm, m, ff_block, x.ff0, x.ffn);
+                    split_blocks(g.ff, l.nm, m, ff_block, x.ff0, x.ffn, l.il % l.nm);
                 else
                     split128(g.ff, l.nm, m, x.ff0, x.ffn, l.il % l.nm);   // (rot: the odd blocks go round the members)
                 size_t off = 0;
@@ -5019,7 +5023,7 @@ struct Model::Impl {
             if (bc[n] > bc[0]) {
                 CK(cudaStreamWaitEvent(s, c.ring_fill[(i1 - 1) % R], 0));
                 CK(cudaMemcpyAsync(bcd, bc, (size_t) (n + 1) * 4, cudaMemcpyHostToDevice, s));
-                if (!run_set(d, c, L0, c.ring + (i0 % R) * c.ring_stride, 0, c.ring_stride, bcd, bc, 0, n, T, err))
+                if (!run_set(d, c, vx, c.ring + (i0 % R) * c.ring_stride, 0, c.ring_stride, bcd, bc, 0, n, T, err))
                     return false;
             }
             for (size_t i = i0; i < i1; ++i) CK(cudaEventRecord(c.ring_free[i % R], s));
@@ -5027,10 +5031,10 @@ struct Model::Impl {
             c.n_comp = i1;
             if (!flow_pump(c, err)) return false;
             const int v_to = (int) ((int64_t) L0.pv_n * (int64_t) (c.n_comp - lb) / (int64_t) std::max<size_t>(1, n_lay));
-            if (!run_vram(d, c, L0, L0, vx, b.data(), v_done, v_to, T, err)) return false;
+            if (!run_vram(d, c, L0, vx, vx, b.data(), v_done, v_to, T, err)) return false;
             v_done = v_to;
         }
-        if (!run_vram(d, c, L0, L0, vx, b.data(), v_done, L0.pv_n, T, err)) return false;
+        if (!run_vram(d, c, L0, vx, vx, b.data(), v_done, L0.pv_n, T, err)) return false;
         while (c.base < c.n_comp && c.items.size() > 4096) {   // (done with: read, copied and used)
             c.items.pop_front();
             ++c.base;
@@ -5483,21 +5487,17 @@ struct Model::Impl {
         for (const Dev& d : devs)
             if (commit_charged(d)) room = commit_room();
         const double room0 = room;
-        // per group: what its tightest member has left.  GGUF members share one expert count, so charge each
-        // layer at its largest member's slot size; a mean can overfill a member with more quantization blocks.
-        // Keep EXL3's mean accounting: its odd 128-blocks rotate among members layer by layer as before.
+        // TP1 and EXL3 retain their per-group mean accounting. GGUF TP below keeps each member's actual balance.
         auto ucount = [](const Layer& l) {
-            double s = 0, largest = 0;
-            for (int m = 0; m < l.nm; ++m) {
-                const double u = (double) unit(member(l, m));
-                s += u;
-                largest = std::max(largest, u);
-            }
-            return l.lay.fmt == gg::kFmtMXFP4 ? largest : s / l.nm;
+            double s = 0;
+            for (int m = 0; m < l.nm; ++m) s += (double) unit(member(l, m));
+            return s / l.nm;
         };
         for (size_t gi = 0; gi < groups.size(); ++gi) {
             double budget = 1e300;
             bool charged = false;
+            std::vector<double> member_budget;
+            std::vector<bool> member_charged;
             for (int m : groups[gi].mem) {
                 cudaSetDevice(devs[(size_t) m].id);
                 size_t fr = 0, tot = 0;
@@ -5512,11 +5512,13 @@ struct Model::Impl {
                     uma_extra = (4.0 + 2.0e-4 * std::max(0.0, (double) o.max_context - 16384.0)) * (double) (1ull << 30);
                     if (const char* v = std::getenv("DS4_UMA_GPU_RESERVE_GB")) uma_extra = std::atof(v) * (double) (1ull << 30);
                 }
-                budget = std::min(budget, std::max(0.0, ((double) fr - (double) ((size_t) o.reserve_mib << 20) - uma_extra)) *
-                                              o.vram_experts);
+                double available = std::max(0.0, (double) fr - (double) ((size_t) o.reserve_mib << 20) - uma_extra) *
+                                   o.vram_experts;
+                budget = std::min(budget, available);
 #if defined(STRATA_METAL)
                 if (o.vram_experts_auto && std::getenv("DS4_NO_AUTO_VX") == nullptr) {
                     const double cap = metal_expert_cap();
+                    available = std::min(available, cap);
                     if (cap < budget) {
                         std::fprintf(stderr, "ds4: expert share: %.1f GB of VRAM experts (the RAM cap leaves %.1f GB; --vram-experts sets it)\n",
                                      cap / 1e9, cap / 1e9);
@@ -5524,7 +5526,77 @@ struct Model::Impl {
                     }
                 }
 #endif
-                charged = charged || commit_charged(devs[(size_t) m]);
+                member_budget.push_back(available);
+                member_charged.push_back(commit_charged(devs[(size_t) m]));
+                charged = charged || member_charged.back();
+            }
+            if (pk.gguf && groups[gi].mem.size() > 1) {
+                // One shared expert count, but a different cost on each member as the larger shards rotate.
+                // Plan once without the commit cap only when needed to report what Windows kept off the GPUs.
+                auto place_group = [&](bool limit_commit) {
+                    std::vector<double> left = member_budget;
+                    double commit_left = limit_commit ? room : 1e300, commit_used = 0;
+                    auto fit = [&](const Layer& l) {
+                        int n = l.n_exp;
+                        double commit_unit = 0;
+                        for (int m = 0; m < l.nm; ++m) {
+                            const double u = (double) unit(member(l, m));
+                            if (u > 0) n = (int) std::min((double) n, std::floor(std::max(0.0, left[(size_t) m]) / u));
+                            if (member_charged[(size_t) m]) commit_unit += u;
+                        }
+                        if (commit_unit > 0)
+                            n = (int) std::min((double) n, std::floor(std::max(0.0, commit_left) / commit_unit));
+                        return n;
+                    };
+                    auto take = [&](const Layer& l, int n) {
+                        n = std::min(n, fit(l));
+                        double charge = 0;
+                        for (int m = 0; m < l.nm; ++m) {
+                            const double bytes = (double) n * unit(member(l, m));
+                            left[(size_t) m] -= bytes;
+                            if (member_charged[(size_t) m]) charge += bytes;
+                        }
+                        commit_left -= charge;
+                        commit_used += charge;
+                        return n;
+                    };
+                    // The drafter is first and has only its actual owner, not every member of its group.
+                    for (Layer& l : L) {
+                        if (l.grp != (int) gi) continue;
+                        l.n_vram = l.mtp && !l.cpu_only ? take(l, l.n_exp) : 0;
+                    }
+                    std::vector<double> want(left.size(), 0.0);
+                    double commit_want = 0;
+                    for (const Layer& l : L) {
+                        if (l.grp != (int) gi || l.mtp || l.cpu_only) continue;
+                        for (int m = 0; m < l.nm; ++m) {
+                            const double bytes = (double) l.n_exp * unit(member(l, m));
+                            want[(size_t) m] += bytes;
+                            if (member_charged[(size_t) m]) commit_want += bytes;
+                        }
+                    }
+                    double frac = 1.0;
+                    for (size_t m = 0; m < want.size(); ++m)
+                        if (want[m] > 0) frac = std::min(frac, std::max(0.0, left[m]) / want[m]);
+                    if (commit_want > 0) frac = std::min(frac, std::max(0.0, commit_left) / commit_want);
+                    for (Layer& l : L)
+                        if (l.grp == (int) gi && !l.mtp && !l.cpu_only)
+                            l.n_vram = take(l, (int) std::floor(frac * l.n_exp));
+                    // Spend the rounded-down remainder in layer order, still checking every member for each addition.
+                    for (Layer& l : L)
+                        if (l.grp == (int) gi && !l.cpu_only)
+                            l.n_vram += take(l, l.n_exp - l.n_vram);
+                    return commit_used;
+                };
+                if (charged && room < 1e300) {
+                    const double uncapped = place_group(false);
+                    const double used = place_group(true);
+                    kept += std::max(0.0, uncapped - used);
+                    room = std::max(0.0, room - used);
+                } else {
+                    place_group(false);
+                }
+                continue;
             }
             if (charged && room < 1e300) {   // (each member's slots charged: the group's share of the room)
                 double all = 0;
