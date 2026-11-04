@@ -18,6 +18,7 @@
 #include "ds4_model.hpp"
 #include "ds4_pick_rule.hpp"
 #include "ds4_experts_rule.hpp"
+#include "ds4_tp_plan.hpp"
 #include "ds4_engram_io.hpp"
 
 #include "ds4_gguf.cuh"
@@ -2676,6 +2677,109 @@ struct Model::Impl {
         }
     }
 
+    // Estimate expert-room balances before any member layouts or dense weights are built. Common
+    // group costs cancel in absolute residual differences; these estimates are not allocation promises.
+    // place_experts still budgets every member from fresh cudaMemGetInfo after the real allocations.
+    std::vector<std::vector<int>> plan_tp_ffn_blocks(int block) const {
+        std::vector<std::vector<int>> planned(L.size());
+        const double fraction = o.vram_experts;
+        if (!pk.gguf || env_tri("DS4_TP_BALANCE") == 0 || !std::isfinite(fraction) || fraction <= 0.0 || block <= 0)
+            return planned;
+        for (size_t gi = 0; gi < groups.size(); ++gi) {
+            const Group& group = groups[gi];
+            const int nm = (int) group.mem.size();
+            if (nm <= 1 || g.ff % block != 0 || g.ff / block < nm) continue;
+            const int max_blocks = (g.ff / block + nm - 1) / nm;
+            std::vector<size_t> indices;
+            std::vector<TpBlockLayer> layers;
+            bool valid = true;
+            for (size_t il = 0; il < L.size(); ++il) {
+                const Layer& l = L[il];
+                if (l.grp != (int) gi || l.mtp) continue;
+                if (l.nm != nm || l.lay.fmt != gg::kFmtMXFP4) { valid = false; break; }
+                TpBlockLayer plan;
+                plan.blocks.resize((size_t) nm);
+                for (int m = 0; m < nm; ++m) {
+                    int at = 0, width = 0;
+                    if (!split_blocks(g.ff, nm, m, block, at, width, l.il % nm)) { valid = false; break; }
+                    plan.blocks[(size_t) m] = width / block;
+                }
+                double shared = 0.0;
+                for (const char* name : {"ffn.shared_experts.w1", "ffn.shared_experts.w2", "ffn.shared_experts.w3"})
+                    shared += (double) mat_bytes(l.name + name);
+                plan.bytes.assign((size_t) max_blocks + 1, 0.0);
+                for (int b = 1; valid && b <= max_blocks; ++b) {
+                    const int width = b * block;
+                    size_t slot = 0;
+                    for (int r = 0; r < 3; ++r) {
+                        const int ty = gg::expert_type(l.lay, r);
+                        const int k = r < 2 ? g.dim : width, n = r < 2 ? width : g.dim;
+                        const int quant_block = gg::type_block(ty);
+                        if (quant_block <= 0 || k % quant_block != 0) { valid = false; break; }
+                        slot += align256((size_t) n * gg::type_row_bytes(ty, k));
+                    }
+                    // Dense shared shards reduce the pre-fraction free-memory budget; routed
+                    // slots consume the resulting expert room directly (as in place_experts).
+                    plan.bytes[(size_t) b] = (l.cpu_only ? 0.0 : (double) slot * l.n_exp) +
+                                             shared * ((double) width / g.ff) * fraction;
+                }
+                if (!valid) break;
+                indices.push_back(il);
+                layers.push_back(std::move(plan));
+            }
+            if (!valid || layers.empty()) continue;
+            std::vector<double> capacity((size_t) nm);
+            for (int m = 0; m < nm; ++m) {
+                const int di = group.mem[(size_t) m];
+                double dense = 0.0, experts = 0.0;
+                for (const Layer& l : L) {
+                    if (l.grp != (int) gi || !l.mtp || l.dev != di) continue;
+                    dense += (double) l.dense_bytes;
+                    if (!l.cpu_only) experts += (double) l.blob * l.n_exp;
+                }
+                if (g.n_mtp > 0 && di == d_dev)
+                    dense += tensor_bytes("mtp.0.main_norm.weight");
+                if (di == head_dev) {
+                    // The head matrix itself is already sharded across its group. Only the
+                    // lead's full logits and additional drafter heads are asymmetric here.
+                    dense += (double) kWin * g.vocab * sizeof(float);
+                    if (g.n_mtp > 0) {
+                        const std::string pre = "mtp." + std::to_string(g.n_mtp - 1) + ".";
+                        dense += tensor_bytes(pre + "confidence_head.proj.weight");
+                        if (const Tensor* t = pk.get(pre + "markov_head.embed.weight")) dense += (double) t->bytes;
+                        if (const Tensor* t = pk.get(pre + "markov_head.head.weight"))
+                            dense += strata::ds4::markov_head_q8_default(defaults_026())
+                                         ? (double) g.vocab * ((g.d_rank + 31) / 32) * gg::kQ8Bytes
+                                         : (double) t->bytes;
+                        dense += (double) (2 * kWin + 64) * sizeof(int);
+                    }
+                }
+                // Do not clamp: common fixed costs cancel in residual differences, not in ratios
+                // or clamped capacities. The fresh placement budget remains the safety authority.
+                capacity[(size_t) m] = ((double) devs[(size_t) di].free0 -
+                                        (double) ((size_t) o.reserve_mib << 20) - dense) * fraction - experts;
+            }
+            const auto baseline = layers;
+            if (!rebalance_tp_blocks(layers, capacity)) continue;
+            long long moved = 0;
+            std::vector<double> totals((size_t) nm, 0.0);
+            for (size_t i = 0; i < layers.size(); ++i) {
+                planned[indices[i]] = layers[i].blocks;
+                for (int m = 0; m < nm; ++m) {
+                    moved += std::abs(layers[i].blocks[(size_t) m] - baseline[i].blocks[(size_t) m]);
+                    totals[(size_t) m] += layers[i].blocks[(size_t) m];
+                }
+            }
+            std::fprintf(stderr, "ds4: GGUF TP balance group %zu: moved %lld blocks (%d values), avg blocks/layer",
+                         gi, moved / 2, block);
+            for (int m = 0; m < nm; ++m)
+                std::fprintf(stderr, " CUDA%d=%.2f", devs[(size_t) group.mem[(size_t) m]].id,
+                             totals[(size_t) m] / layers.size());
+            std::fprintf(stderr, " (estimated expert room; DS4_TP_BALANCE=0 keeps rotation)\n");
+        }
+        return planned;
+    }
+
     // ---- loading
     bool load(const Options& opt, std::string& err) {
         o = opt;
@@ -3161,6 +3265,7 @@ struct Model::Impl {
                                  "fit, but leave less than the %lld MiB reserve for the caches and scratch (--reserve-mib); the "
                                  "load goes on\n", d.id, (double) d.free0 / 1e9, need / 1e9, (long long) o.reserve_mib);
         }
+        const auto tp_blocks = plan_tp_ffn_blocks(ff_block);
         // the groups' members: copies of each layer's device state, a member's part of an expert
         for (Layer& l : L) {
             l.ff0 = 0;
@@ -3184,8 +3289,9 @@ struct Model::Impl {
                 c.dev = groups[(size_t) l.grp].mem[(size_t) m];
                 l.mates.push_back(std::move(c));
             }
-            // EXL3 rotates its 128-block shares; GGUF rotates common quantization/alignment
-            // blocks by the same layer index. The shared expert uses these same member ranges.
+            // EXL3 retains its rotated 128-block shares. GGUF uses the capacity-aware plan,
+            // or its original rotation when no legal improvement exists; shared uses the same ranges.
+            int ff_at = 0;
             for (int m = 0; m < l.nm; ++m) {
                 Layer& x = member(l, m);
                 const int ha = m - (l.nm - na);   // (its place among the members with heads)
@@ -3193,7 +3299,11 @@ struct Model::Impl {
                 x.ah0 = ha < 0 ? 0 : ha * x.ahn;
                 x.ogn = ha < 0 ? 0 : g.o_groups / na;
                 x.og0 = ha < 0 ? 0 : ha * x.ogn;
-                if (gguf_x)
+                if (gguf_x && !tp_blocks[(size_t) l.il].empty()) {
+                    x.ff0 = ff_at;
+                    x.ffn = tp_blocks[(size_t) l.il][(size_t) m] * ff_block;
+                    ff_at += x.ffn;
+                } else if (gguf_x)
                     split_blocks(g.ff, l.nm, m, ff_block, x.ff0, x.ffn, l.il % l.nm);
                 else
                     split128(g.ff, l.nm, m, x.ff0, x.ffn, l.il % l.nm);   // (rot: the odd blocks go round the members)
