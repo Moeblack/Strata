@@ -122,7 +122,7 @@ void usage() {
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT\n"
                  "           | --pack-info)\n"
                  "  --tp N   Cards sharing each layer (default 2; 1 = layer split).\n"
-                 "           GGUF IQ2_XS --tp 4 splits 2304 in whole blocks: 768,512,512,512 (four GPUs required).\n");
+                 "           GGUF IQ2_XS --tp 4 splits 2304 in whole blocks: 768,512,512,512, rotating the larger share by layer.\n");
 }
 
 // stdin lines on a thread, so a request can see STOP while it decodes.  read(2), not std::cin - glibc's exit()
