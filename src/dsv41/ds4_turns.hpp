@@ -127,10 +127,27 @@ inline TurnAlignment align_turns(const std::vector<StateToken>& state,
         while (i < v.size() && turn_role(static_cast<int64_t>(v[i]), ids) == TurnRole::Preamble) ++i;
         return i;
     };
+    // History proof, once per request: the tail of the state's latest turn (its
+    // last answer, up to 24 tokens; clients may strip that answer's reasoning)
+    // must come back in the request with more after it. Two different fresh
+    // prompts in one template share a head and a tail, yet neither request
+    // carries the other's cached answer, so they never alias.
+    const bool history = [&]() {
+        if (topology.empty() || topology.back().role == TurnRole::Preamble) return false;
+        const auto len = std::min<std::size_t>(24, state.size() - topology.back().begin - 1);
+        if (len < 2) return false;
+        const auto lt = state.size() - len;
+        for (std::size_t j = 0; j + len < request.size(); ++j) {
+            std::size_t k = 0;
+            while (k < len && eq(lt + k, j + k)) ++k;
+            if (k == len) return true;
+        }
+        return false;
+    }();
     // At a mismatch inside turn `role`: keep the cached rest of the turn's middle,
     // skip the request's shorter replacement, resume at the common turn tail.
     const auto shrink = [&]() -> bool {
-        if (role != TurnRole::User && role != TurnRole::Assistant) return false;
+        if (!history || (role != TurnRole::User && role != TurnRole::Assistant)) return false;
         const auto se = next_role(state, s);
         const auto re = next_role(request, r);
         if (se >= state.size() || re >= request.size() || !eq(se, re)) return false;
@@ -174,6 +191,7 @@ inline TurnAlignment align_turns(const std::vector<StateToken>& state,
             // A different retained picture is an edit, not an omission. Only a
             // picture absent from the request can be left in the cached history.
             if (!b && (role == TurnRole::User || role == TurnRole::Assistant)) {
+                if (shrink()) continue;   // the picture may have left a placeholder behind
                 append(s + n, TurnState::Elided);
                 s += n;
                 continue;
