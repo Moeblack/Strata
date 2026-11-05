@@ -262,6 +262,12 @@ public:
     /// `data` (a slot's bytes) back into the model: the state at the slot's position n_pos, as slot_save took it -
     /// what a prompt that continues the slot's tokens reads on from (the caller checked the tokens are a prefix).
     bool slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err);
+    /// Load only the selected slot's exact tokens/images, then restore its endpoint or exact checkpoint restore_to.
+    /// false leaves the original live sequence unchanged, even if it was already saved; err describes the miss.
+    /// Throws std::runtime_error if rollback fails: the model must not be used after that unrecoverable error.
+    bool slot_load_checked(const uint8_t* data, size_t bytes, int64_t n_pos, int64_t restore_to,
+                           const std::vector<int32_t>& expected_tokens,
+                           const std::vector<ImageSpan>& expected_images, std::string& err);
     /// What a saved conversation must match: this engine's version, this model's geometry and files and the drafter's
     /// blocks - a slot naming anything else is not this model's state (a file's .meta says so; slot_load refuses).
     std::string slot_identity() const;

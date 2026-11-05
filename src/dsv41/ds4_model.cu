@@ -72,6 +72,7 @@ extern "C" void ds4_busy_end();
 #include <mutex>
 #include <numeric>
 #include <sstream>
+#include <stdexcept>
 #include <thread>
 #include <unordered_map>
 
@@ -7547,7 +7548,12 @@ struct Model::Impl {
         return n;
     }
 
-    bool restore(int64_t limit) {
+    bool restore(int64_t limit, std::string* err = nullptr) {
+        const auto copied = [&](cudaError_t status) {
+            if (status == cudaSuccess) return true;
+            if (err != nullptr) *err = std::string("checkpoint restore: ") + cudaGetErrorString(status);
+            return false;
+        };
         const int b = best_check(limit);
         if (b < 0) return false;
         const Check& c = check_at(b);
@@ -7556,17 +7562,18 @@ struct Model::Impl {
             for (int m = 0; m < L[i].nm; ++m) {   // (a group's members hold the same state: the lead's copy)
                 Layer& l = member(L[i], m);
                 Dev& d = devs[(size_t) l.dev];
-                cudaSetDevice(d.id);
-                cudaMemcpyAsync(l.win, c.win[i].data(), c.win[i].size(), cudaMemcpyHostToDevice, d.st);
+                if (!copied(cudaSetDevice(d.id)) ||
+                    !copied(cudaMemcpyAsync(l.win, c.win[i].data(), c.win[i].size(), cudaMemcpyHostToDevice, d.st)))
+                    return false;
                 if (l.c_kv) {
-                    cudaMemcpyAsync(l.c_kv, c.comp[2 * i].data(), c.comp[2 * i].size() * 4, cudaMemcpyHostToDevice, d.st);
-                    cudaMemcpyAsync(l.c_score, c.comp[2 * i + 1].data(), c.comp[2 * i + 1].size() * 4,
-                                    cudaMemcpyHostToDevice, d.st);
+                    if (!copied(cudaMemcpyAsync(l.c_kv, c.comp[2 * i].data(), c.comp[2 * i].size() * 4,
+                                                cudaMemcpyHostToDevice, d.st)) ||
+                        !copied(cudaMemcpyAsync(l.c_score, c.comp[2 * i + 1].data(), c.comp[2 * i + 1].size() * 4,
+                                                cudaMemcpyHostToDevice, d.st))) return false;
                 }
             }
         for (Dev& d : devs) {
-            cudaSetDevice(d.id);
-            cudaStreamSynchronize(d.st);
+            if (!copied(cudaSetDevice(d.id)) || !copied(cudaStreamSynchronize(d.st))) return false;
         }
         pos = c.pos;
         toks.resize((size_t) pos);
@@ -7611,7 +7618,7 @@ struct Model::Impl {
     // on past it - the window rings and partial groups from that mark, the compressed KV and index keys of rows 0 .. at / ratio
     // (the rows a position completed never change), the tokens up to it.  The mark stays; the slot holds the checkpoints
     // at or before it.  (A shared start kept from a read that went on past it: #607 without a stop at the start.)
-    uint64_t slot_save(std::vector<uint8_t>& out, std::string& err, int64_t at = -1) {
+    uint64_t slot_save(std::vector<uint8_t>& out, std::string& err, int64_t at = -1, bool backup = false) {
         const Check* at_mark = nullptr;
         if (at >= 0 && at != pos) {
             for (const Check& x : mk)
@@ -7623,7 +7630,7 @@ struct Model::Impl {
         } else
             at = -1;
         const int64_t ep = at < 0 ? pos : at;
-        if (slot_held && at < 0) {
+        if (slot_held && at < 0 && !backup) {
             err = "it is already set aside";
             return 0;
         }
@@ -7679,13 +7686,21 @@ struct Model::Impl {
             put(&s.hash, 8);
         }
         for (Dev& d : devs) {   // (the devices' work ends before their state is read)
-            cudaSetDevice(d.id);
-            cudaStreamSynchronize(d.st);
+            const cudaError_t selected = cudaSetDevice(d.id);
+            const cudaError_t synced = selected == cudaSuccess ? cudaStreamSynchronize(d.st) : selected;
+            if (synced != cudaSuccess) {
+                err = std::string("slot save synchronization: ") + cudaGetErrorString(synced);
+                return 0;
+            }
         }
         for (size_t i = 0; i < L.size(); ++i) {
             const Layer& l = L[i];
             const Dev& d = devs[(size_t) l.dev];
-            cudaSetDevice(d.id);
+            const cudaError_t selected = cudaSetDevice(d.id);
+            if (selected != cudaSuccess) {
+                err = std::string("slot save device: ") + cudaGetErrorString(selected);
+                return 0;
+            }
             const uint64_t wb = (uint64_t) g.win * win_rb();
             put(&wb, 8);
             if (at_mark != nullptr) {   // (the ring and the partial group as the mark kept them)
@@ -7722,7 +7737,11 @@ struct Model::Impl {
                 return 0;
             }
             const size_t cb = (size_t) rows * ckv_rb(), ib = (size_t) rows * ik_rb();
-            cudaSetDevice(devs[(size_t) di].id);
+            const cudaError_t selected = cudaSetDevice(devs[(size_t) di].id);
+            if (selected != cudaSuccess) {
+                err = std::string("slot save device: ") + cudaGetErrorString(selected);
+                return 0;
+            }
             if (cudaMemcpy(p + off, ckv, cb, cudaMemcpyDeviceToHost) != cudaSuccess ||
                 (ik != nullptr && cudaMemcpy(p + off + cb, ik, ib, cudaMemcpyDeviceToHost) != cudaSuccess)) {
                 err = "source layer " + std::to_string(s.layer) + "'s compressed KV: " + cudaGetErrorString(cudaGetLastError());
@@ -7753,7 +7772,7 @@ struct Model::Impl {
             return 0;
         }
         put(&kSlotMagic, 8);
-        if (at < 0) slot_held = true;   // (a slot of an earlier point leaves the conversation as it is)
+        if (at < 0 && !backup) slot_held = true;   // a rollback backup must not mark the live state as saved
         return (uint64_t) off;
     }
 
@@ -7878,13 +7897,21 @@ struct Model::Impl {
         }
         off = state_off;
         for (Dev& d : devs) {   // (their work ends before the state is written over)
-            cudaSetDevice(d.id);
-            cudaStreamSynchronize(d.st);
+            const cudaError_t selected = cudaSetDevice(d.id);
+            const cudaError_t synced = selected == cudaSuccess ? cudaStreamSynchronize(d.st) : selected;
+            if (synced != cudaSuccess) {
+                err = std::string("slot load synchronization: ") + cudaGetErrorString(synced);
+                return false;
+            }
         }
         for (size_t i = 0; i < L.size(); ++i) {
             Layer& l = L[i];
             const Dev& d = devs[(size_t) l.dev];
-            cudaSetDevice(d.id);
+            const cudaError_t selected = cudaSetDevice(d.id);
+            if (selected != cudaSuccess) {
+                err = std::string("slot load device: ") + cudaGetErrorString(selected);
+                return false;
+            }
             uint64_t wb = 0, cn = 0;
             if (!room(8)) {
                 err = "the slot is cut short";
@@ -7899,8 +7926,9 @@ struct Model::Impl {
             wrote = true;
             for (int m = 0; m < l.nm; ++m) {
                 Layer& lm = member(l, m);
-                cudaSetDevice(devs[(size_t) lm.dev].id);   // (a tensor-parallel group's members sit on different GPUs: #4350)
-                if (cudaMemcpy(lm.win, data + off, (size_t) wb, cudaMemcpyHostToDevice) != cudaSuccess) {
+                // A tensor-parallel group's members sit on different GPUs.
+                if (cudaSetDevice(devs[(size_t) lm.dev].id) != cudaSuccess ||
+                    cudaMemcpy(lm.win, data + off, (size_t) wb, cudaMemcpyHostToDevice) != cudaSuccess) {
                     err = l.name + "window ring: " + cudaGetErrorString(cudaGetLastError());
                     return false;
                 }
@@ -7920,8 +7948,8 @@ struct Model::Impl {
                 }
                 for (int m = 0; m < l.nm; ++m) {
                     Layer& lm = member(l, m);
-                    cudaSetDevice(devs[(size_t) lm.dev].id);
-                    if (cudaMemcpy(lm.c_kv, data + off, cb, cudaMemcpyHostToDevice) != cudaSuccess ||
+                    if (cudaSetDevice(devs[(size_t) lm.dev].id) != cudaSuccess ||
+                        cudaMemcpy(lm.c_kv, data + off, cb, cudaMemcpyHostToDevice) != cudaSuccess ||
                         cudaMemcpy(lm.c_score, data + off + cb, cb, cudaMemcpyHostToDevice) != cudaSuccess) {
                         err = l.name + "compressor's group: " + cudaGetErrorString(cudaGetLastError());
                         return false;
@@ -7950,7 +7978,11 @@ struct Model::Impl {
             }
             for (size_t di = 0; di < devs.size(); ++di) {
                 if (s.ckv[di] == nullptr && s.ik[di] == nullptr) continue;
-                cudaSetDevice(devs[di].id);
+                const cudaError_t selected = cudaSetDevice(devs[di].id);
+                if (selected != cudaSuccess) {
+                    err = std::string("slot load device: ") + cudaGetErrorString(selected);
+                    return false;
+                }
                 if (s.ckv[di] != nullptr && cudaMemcpy(s.ckv[di], data + off, cb, cudaMemcpyHostToDevice) != cudaSuccess) {
                     err = "source layer " + std::to_string(s.layer) + "'s compressed KV: " + cudaGetErrorString(cudaGetLastError());
                     return false;
@@ -8046,6 +8078,89 @@ struct Model::Impl {
         slot_held = false;
         ok = true;
         return true;
+    }
+
+    bool slot_load_checked(const uint8_t* data, size_t bytes, int64_t n_pos, int64_t restore_to,
+                           const std::vector<int32_t>& expected_tokens,
+                           const std::vector<ImageSpan>& expected_images, std::string& err) {
+        err.clear();
+        if (data == nullptr || n_pos <= 0 || n_pos > o.max_context || restore_to <= 0 || restore_to > n_pos ||
+            expected_tokens.size() != (size_t) n_pos || !image_spans_valid(expected_images, n_pos) ||
+            image_prefix(expected_images, expected_images, restore_to) != restore_to) {
+            err = "the selected slot's metadata or restore position is invalid";
+            return false;
+        }
+
+        // Serialize device state without slot_save's already-held shortcut or its held-state side effect.
+        // Nothing has been changed if this read-only backup fails.
+        std::vector<uint8_t> backup;
+        if (pos > 0 && slot_save(backup, err, -1, true) == 0) {
+            err = "cannot back up the live conversation: " + err;
+            return false;
+        }
+        // Slots omit embeddings, future spans, invalid checkpoints and exact mark LRU clocks. Keep all
+        // host state separately, moving (not duplicating) the potentially large checkpoint buffers.
+        SeqState original;
+        original.pos = pos;
+        original.toks = std::move(toks);
+        original.ctoks = std::move(ctoks);
+        original.spans = std::move(spans);
+        original.imgs = std::move(imgs);
+        for (int k = 0; k < 3; ++k) original.ck[k] = std::move(ck[k]);
+        original.mk = std::move(mk);
+        original.mark_clock = mark_clock;
+        original.slot_held = slot_held;
+
+        const auto rollback = [&]() {
+            std::string rollback_err;
+            try {
+                if (original.pos > 0) {
+                    if (!slot_load(backup.data(), backup.size(), original.pos, rollback_err))
+                        throw std::runtime_error(rollback_err);
+                } else {
+                    reset();
+                }
+            } catch (const std::exception& failure) {
+                throw std::runtime_error(std::string("unrecoverable slot rollback failure; model state is unusable: ") +
+                                         failure.what());
+            } catch (...) {
+                throw std::runtime_error("unrecoverable slot rollback failure; model state is unusable");
+            }
+            pos = original.pos;
+            toks = std::move(original.toks);
+            ctoks = std::move(original.ctoks);
+            spans = std::move(original.spans);
+            imgs = std::move(original.imgs);
+            for (int k = 0; k < 3; ++k) ck[k] = std::move(original.ck[k]);
+            mk = std::move(original.mk);
+            mark_clock = original.mark_clock;
+            slot_held = original.slot_held;
+        };
+
+        try {
+            if (slot_load(data, bytes, n_pos, err)) {
+                const bool same_images = spans.size() == expected_images.size() &&
+                    std::equal(spans.begin(), spans.end(), expected_images.begin(), [](const ImageSpan& a, const ImageSpan& b) {
+                        return a.start == b.start && a.len == b.len && a.hash == b.hash;
+                    });
+                if (toks != expected_tokens || !same_images) {
+                    err = "the slot's tokens or images do not match the selected metadata";
+                } else if (restore_to == n_pos) {
+                    return true;
+                } else if (restorable(restore_to) != restore_to) {
+                    err = "the selected slot has no checkpoint at the requested restore position";
+                } else if (restore(restore_to, &err) && pos == restore_to) {
+                    return true;
+                } else if (err.empty()) {
+                    err = "the selected slot could not restore the requested checkpoint";
+                }
+            }
+        } catch (...) {
+            rollback();
+            throw;
+        }
+        rollback();
+        return false;
     }
 
     std::string slot_identity() const {
@@ -15472,6 +15587,11 @@ int64_t Model::restorable(int64_t limit) const { return p_->restorable(limit); }
 uint64_t Model::slot_save(std::vector<uint8_t>& out, std::string& err, int64_t at) { return p_->slot_save(out, err, at); }
 bool Model::slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err) {
     return p_->slot_load(data, bytes, n_pos, err);
+}
+bool Model::slot_load_checked(const uint8_t* data, size_t bytes, int64_t n_pos, int64_t restore_to,
+                              const std::vector<int32_t>& expected_tokens,
+                              const std::vector<ImageSpan>& expected_images, std::string& err) {
+    return p_->slot_load_checked(data, bytes, n_pos, restore_to, expected_tokens, expected_images, err);
 }
 std::string Model::slot_identity() const { return p_->slot_identity(); }
 void Model::settle_idle(const std::atomic<bool>& cancel) { p_->cache_settle_idle(cancel); }
