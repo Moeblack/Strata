@@ -11,7 +11,8 @@
 // <decode ms> <stop|length|cancel> 0 0 <reused> 0 0`; `STOP` ends a request early, `QUIT` the engine.  A prompt that
 // continues the state (the conversation so far) reuses it; one that only shares the last prompt's start goes back to
 // that prompt's end; anything else starts over.  `GENI <max_new> [keys] <file> <ids>` carries the prompt's pictures
-// (the file: see read_pics); the state is shared only where the same picture sits at the same place.  With
+// (the file: see read_pics); matching leading image omissions retain the previous causal conditioning, rather than
+// removing it. STRATA_DS4_IMAGE_HISTORY=0 disables this reconciliation; otherwise pictures must match their positions.
 // STRATA_DS4_SLOT_KEEP=1 the conversations are kept when another one takes the model (a slot each: the state, the
 // compressed KV included), and across runs in STRATA_DS4_SLOT_DIR - so a request that does not continue the state but
 // does continue a kept conversation reads only its new tokens.
@@ -36,6 +37,7 @@
 #include "strata/platform/io_priority.hpp"
 #include "ds4_packinfo.hpp"
 #include "ds4_slotmeta.hpp"
+#include "ds4_image_history.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -362,6 +364,7 @@ struct Req {
     int pen_n = 0;
     float pen_repeat = 1.0f, pen_freq = 0.0f, pen_present = 0.0f;
     std::string file;   // GENI: the pictures
+    bool allow_image_history = true;   // false when idle histories cannot identify the omitted pictures unambiguously
     std::vector<int> ids;
 };
 
@@ -563,6 +566,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     const bool slot_keep =
         std::getenv("STRATA_DS4_SLOT_KEEP") != nullptr && std::atoi(std::getenv("STRATA_DS4_SLOT_KEEP")) != 0;
     const bool reuse = std::getenv("STRATA_DS4_REUSE") == nullptr || std::atoi(std::getenv("STRATA_DS4_REUSE")) != 0;
+    // Omitted old pictures stay in the causal history, not in the incoming request.  No KV is moved or rebased.
+    // Disable for callers that require removing pictures to change the model's historical conditioning.
+    const bool image_history = reuse && (std::getenv("STRATA_DS4_IMAGE_HISTORY") == nullptr ||
+                                         std::atoi(std::getenv("STRATA_DS4_IMAGE_HISTORY")) != 0);
     int slot_max = slot_keep ? std::max(0, (int) env_num("STRATA_DS4_SLOT_CAP", 4)) : 0;
     const size_t slot_min = (size_t) std::max(1.0, env_num("STRATA_DS4_SLOT_MIN", 1024));
     const double slot_days = env_num("STRATA_DS4_SLOT_DAYS", 7);
@@ -740,15 +747,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // whole (`whole`); one it leaves part way - a retried prompt, a history the client renders again without the
     // earlier reasoning - comes back at its latest checkpoint the prompt still agrees with (the end of a prompt, the
     // position before it, the anchor where its run of continued prompts began).
-    const auto slot_take = [&](const std::vector<int>& prompt, const std::vector<strata::ds4::ImageSpan>& images,
-                               size_t floor, bool& whole) -> size_t {
+    const auto slot_restore = [&](size_t best, size_t len, size_t prompt_tokens, bool& whole) -> size_t {
         whole = false;
-        if (slot_max <= 0 || prompt.size() < 2) return 0;
-        std::vector<strata::ds4::slotmeta::Cand> cands;
-        for (const Slot& sl : slots) cands.push_back({&sl.tokens, &sl.cks, &sl.images});
-        size_t len = 0;
-        const size_t best = strata::ds4::slotmeta::pick(cands, prompt, floor, &len, images);
-        if (best == SIZE_MAX) return 0;
         const size_t whole_len = slots[best].tokens.size();
         const auto t0 = std::chrono::steady_clock::now();
         const bool ram = slots[best].data != nullptr;
@@ -800,9 +800,19 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::snprintf(msg, sizeof msg, "took back a %zu-token conversation%s from %s (%.1f s); %zu new tokens to read",
                       len, part.c_str(), ram ? "RAM" : "the folder",
                       std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
-                      prompt.size() - len);
+                      prompt_tokens - len);
         note(msg);
         return len;
+    };
+    const auto slot_take = [&](const std::vector<int>& prompt, const std::vector<strata::ds4::ImageSpan>& images,
+                               size_t floor, bool& whole) -> size_t {
+        whole = false;
+        if (slot_max <= 0 || prompt.size() < 2) return 0;
+        std::vector<strata::ds4::slotmeta::Cand> cands;
+        for (const Slot& sl : slots) cands.push_back({&sl.tokens, &sl.cks, &sl.images});
+        size_t len = 0;
+        const size_t best = strata::ds4::slotmeta::pick(cands, prompt, floor, &len, images);
+        return best == SIZE_MAX ? 0 : slot_restore(best, len, prompt.size(), whole);
     };
     // SHARED STARTS (#607): the state at the end of a system prompt and its tools (the shared start of a prompt read from
     // token 0) is also kept apart from its conversation, in RAM, so a NEW conversation behind the same start - after an
@@ -1025,6 +1035,35 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         }
         return out;
     };
+    const auto same_omissions = [](const strata::ds4::ImageHistoryPlan& a, const strata::ds4::ImageHistoryPlan& b) {
+        if (a.omitted.size() != b.omitted.size()) return false;
+        for (size_t i = 0; i < a.omitted.size(); ++i) {
+            const auto& x = a.omitted[i];
+            const auto& y = b.omitted[i];
+            if (x.start != y.start || x.len != y.len || x.hash != y.hash) return false;
+        }
+        return true;
+    };
+    // A plan only covers a complete restorable state.  Missing pictures are never
+    // synthesized for prefill: they must already be represented by that state's KV.
+    const auto history_match = [&](const Req& r, const std::vector<strata::ds4::ImageSpan>& images,
+                                   const std::vector<int32_t>& tokens,
+                                   const std::vector<strata::ds4::ImageSpan>& cached_images,
+                                   const std::vector<int64_t>& checkpoints) {
+        strata::ds4::ImageHistoryPlan plan;
+        if (!image_history || !r.allow_image_history || cached_images.empty() || r.max_new > m.max_context()) return plan;
+        const int64_t budget = m.max_context() - std::max(0LL, r.max_new);
+        plan = strata::ds4::reconcile_image_history(tokens, cached_images, r.ids, images, img_tok, budget);
+        if (plan.valid()) return plan;
+        std::vector<int64_t> points = checkpoints;
+        std::sort(points.begin(), points.end(), std::greater<int64_t>());
+        for (int64_t at : points) {
+            if (at <= 0 || (uint64_t) at >= tokens.size()) continue;
+            plan = strata::ds4::reconcile_image_history(tokens, cached_images, r.ids, images, img_tok, budget, (size_t) at);
+            if (plan.valid()) return plan;
+        }
+        return strata::ds4::ImageHistoryPlan{};
+    };
     // a request's prompt into the bound conversation (one conversation's requests and --parallel's alike): its
     // pictures read, the state it continues reused (in place, a checkpoint, or a kept conversation), the rest read.
     // Its lines carry `tag` (" <rid>" with --parallel), stop_now() is its STOP; false: it ended here (its ERR or
@@ -1037,6 +1076,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         bool continued = false;  // (the conversation goes on - its anchor stays)
         bool pictures_ready = false;
         std::vector<Pic> pics;
+        strata::ds4::ImageHistoryPlan history;
+        size_t request_tokens = 0;   // immutable wire length, before history expansion
+        size_t request_pos(size_t pos) const {
+            return std::min(request_tokens, history.valid() ? history.to_request(pos) : pos);
+        }
         std::vector<strata::ds4::MarkAt> cuts;   // the restore points the read stops at (ds4_marks.hpp)
         size_t next_cut = 0;                     // (the next of them)
         int64_t tail_at = -1;                    // (the tail point the read keeps, TailCost)
@@ -1046,6 +1090,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     const auto prepare_pictures = [&](Req& r, bool geni, const std::string& tag, Prompt& P) -> bool {
         const double t0 = now_ms();
         P.t0 = t0;
+        P.request_tokens = r.ids.size();
         std::vector<Pic>& pics = P.pics;
         pics.clear();
         {
@@ -1077,6 +1122,70 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         P.pictures_ready = true;
         return true;
     };
+    // Select in request coordinates, restore in model coordinates, and only then
+    // commit the expanded prompt. A failed load leaves the original request intact.
+    const auto history_take = [&](Req& r, std::vector<strata::ds4::ImageSpan>& images,
+                                  Prompt& P, size_t floor, bool displaced, bool& continued) -> size_t {
+        if (!image_history || !r.allow_image_history) return 0;
+        enum class Source { current, slot, prefix };
+        Source source = Source::current;
+        size_t index = 0;
+        strata::ds4::ImageHistoryPlan best;
+        bool ambiguous = false;
+        const auto consider = [&](strata::ds4::ImageHistoryPlan plan, Source kind, size_t at) {
+            if (!plan.valid() || plan.retained_tokens <= floor) return;
+            if (!best.valid() || plan.retained_tokens > best.retained_tokens) {
+                best = std::move(plan);
+                source = kind;
+                index = at;
+                ambiguous = false;
+            } else if (plan.retained_tokens == best.retained_tokens) {
+                // Identical visible histories with different forgotten pictures
+                // cannot identify a conversation. Fall back rather than guess.
+                if (!same_omissions(plan, best)) ambiguous = true;
+            }
+        };
+        consider(history_match(r, images, m.tokens(), m.image_spans(), m.check_positions()), Source::current, 0);
+        for (size_t i = 0; i < slots.size(); ++i)
+            consider(history_match(r, images, slots[i].tokens, slots[i].images, slots[i].cks), Source::slot, i);
+        for (size_t i = 0; i < prefixes.size(); ++i)
+            consider(history_match(r, images, prefixes[i].tokens, prefixes[i].images, {}), Source::prefix, i);
+        if (!best.valid() || ambiguous) return 0;
+        // A true continuation must not serialize its huge live state just because
+        // the client stopped transmitting old pixels. Other restores save it first.
+        if (!displaced && (source != Source::current || best.cached_tokens != m.tokens().size())) return 0;
+        std::vector<int> expanded;
+        std::vector<strata::ds4::ImageSpan> expanded_images;
+        if (!strata::ds4::apply_image_history(best, r.ids, images, img_tok, expanded, expanded_images)) return 0;
+        const size_t resume = best.cached_tokens;
+        bool loaded = false, whole = false;
+        if (source == Source::current) {
+            whole = resume == m.tokens().size();
+            loaded = whole || (m.restore((int64_t) resume) && (size_t) m.pos() == resume);
+        } else if (source == Source::slot) {
+            loaded = slot_restore(index, resume, expanded.size(), whole) == resume;
+        } else {
+            loaded = prefix_take((int) index);
+        }
+        if (!loaded || m.tokens().size() != resume ||
+            !std::equal(m.tokens().begin(), m.tokens().end(), expanded.begin()) ||
+            strata::ds4::image_prefix(m.image_spans(), expanded_images, (int64_t) resume) != (int64_t) resume) {
+            m.reset();
+            return 0;
+        }
+        for (Pic& q : P.pics) q.start = best.to_model(q.start);
+        for (int64_t& at : r.marks) at = best.to_model(at);
+        r.tail = best.to_model(r.tail);
+        r.shared = best.to_model(r.shared);
+        if (r.pin >= 256) r.pin = best.to_model(r.pin);
+        r.ids = std::move(expanded);
+        images = std::move(expanded_images);
+        continued = whole;
+        std::fprintf(stderr, "ds4: retained %zu historical pictures (%zu model tokens); reused %zu request tokens at model position %zu\n",
+                     best.omitted.size(), resume - best.retained_tokens, best.retained_tokens, resume);
+        P.history = std::move(best);
+        return resume;
+    };
     // Begin the bound conversation, then read its prompt in pieces and keep its end checkpoints.
     const auto prompt_begin = [&](Req& r, bool geni, const std::string& tag, Prompt& P) -> bool {
         if (!P.pictures_ready && !prepare_pictures(r, geni, tag, P)) return false;
@@ -1102,26 +1211,43 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             continued = true;
         }
         else {
-            // CONVERSATION SLOTS: this prompt does not continue the conversation in the model - that one is set aside
-            // first (another one takes the model, and its state is lost otherwise), then the kept conversation this
-            // prompt does continue is taken back - if it goes further back than the checkpoints the state itself holds
-            slot_put("");
-            const int64_t limit = (int64_t) std::min(c, r.ids.size() - 1);
-            const int64_t rs = m.restorable(limit);
-            bool whole = false;
-            // (a kept shared start, when it covers more than the state itself can go back to; a kept conversation only
-            //  when it covers more than either)
-            const int pi = prefix_find(r.ids, images, rs > 0 ? (size_t) rs : 0);
-            const size_t plen = pi >= 0 ? prefixes[(size_t) pi].tokens.size() : 0;
-            const size_t back = slot_take(r.ids, images, std::max(rs > 0 ? (size_t) rs : 0, plen), whole);
-            if (back > 0) {
-                from = back;
-                continued = whole;
-            } else if (pi >= 0 && prefix_take(pi)) {
-                from = plen;
-            } else if (rs >= 0 && m.restore(limit))
-                from = (size_t) m.pos();
-            else m.reset();
+            // An exact cache wins ties; image retention must save additional visible
+            // prompt work. Compare all tiers before changing any request coordinates.
+            size_t floor = (size_t) std::max<int64_t>(0, m.restorable((int64_t) std::min(c, r.ids.size() - 1)));
+            const int exact_prefix = prefix_find(r.ids, images, floor);
+            if (exact_prefix >= 0) floor = prefixes[(size_t) exact_prefix].tokens.size();
+            std::vector<strata::ds4::slotmeta::Cand> candidates;
+            for (const Slot& sl : slots) candidates.push_back({&sl.tokens, &sl.cks, &sl.images});
+            size_t exact_slot = 0;
+            strata::ds4::slotmeta::pick(candidates, r.ids, floor, &exact_slot, images);
+            floor = std::max(floor, exact_slot);
+            from = history_take(r, images, P, floor, false, continued);
+            if (from == 0) {
+                slot_put("");
+                from = history_take(r, images, P, floor, true, continued);
+            }
+            if (from == 0) {
+                // A failed history load may have reset the model. Re-evaluate its
+                // strict prefix rather than using a restore point from the old state.
+                c = 0;
+                const auto& current = m.tokens();
+                while (c < current.size() && c < r.ids.size() && current[c] == r.ids[c]) ++c;
+                c = (size_t) strata::ds4::image_prefix(m.image_spans(), images, (int64_t) c);
+                const int64_t limit = (int64_t) std::min(c, r.ids.size() - 1);
+                const int64_t rs = m.restorable(limit);
+                bool whole = false;
+                const int pi = prefix_find(r.ids, images, rs > 0 ? (size_t) rs : 0);
+                const size_t plen = pi >= 0 ? prefixes[(size_t) pi].tokens.size() : 0;
+                const size_t back = slot_take(r.ids, images, std::max(rs > 0 ? (size_t) rs : 0, plen), whole);
+                if (back > 0) {
+                    from = back;
+                    continued = whole;
+                } else if (pi >= 0 && prefix_take(pi)) {
+                    from = plen;
+                } else if (rs >= 0 && m.restore(limit))
+                    from = (size_t) m.pos();
+                else m.reset();
+            }
         }
         if ((int64_t) r.ids.size() + std::max(0LL, r.max_new) > m.max_context()) {
             std::printf("ERR%s the prompt (%zu tokens) and max_new %lld are more than the context %lld\n", tag.c_str(),
@@ -1162,7 +1288,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         if (!ok) {
             std::fprintf(stderr, "ds4: %s\n", err.c_str());
             std::printf("ERR%s %s\n", tag.c_str(), err.c_str());
-            std::printf("DONE%s 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", tag.c_str(), r.ids.size());
+            std::printf("DONE%s 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", tag.c_str(), P.request_pos(r.ids.size()));
             std::fflush(stdout);
             m.set_images({});
             m.reset();
@@ -1204,7 +1330,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             const long long shared = r.shared >= 0 ? r.shared : (r.pin >= 256 ? r.pin : -1);
             if (!asked.empty() || shared >= 0) {
                 std::vector<std::pair<int64_t, int64_t>> spans;
-                for (const Pic& q : pics) spans.push_back({q.start, (int64_t) q.len});
+                for (const auto& q : images) spans.push_back({q.start, q.len});
                 cuts = strata::ds4::mark_plan(asked, shared, (int64_t) from, (int64_t) total, m.marks_cap(), 16, spans);
             }
         }
@@ -1241,8 +1367,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         bool ok = true;
         m.set_progress([&](int64_t d) {   // (a run of chunks: each one through every layer)
             const double ms = now_ms() - t0;
-            std::printf("PP%s %zu %zu %.1f %.1f %zu\n", tag.c_str(), done + (size_t) d, r.ids.size(), ms,
-                        ms > 0 ? 1000.0 * (double) (done + (size_t) d - from) / ms : 0.0, from);
+            std::printf("PP%s %zu %zu %.1f %.1f %zu\n", tag.c_str(), P.request_pos(done + (size_t) d),
+                        P.request_pos(r.ids.size()), ms,
+                        ms > 0 ? 1000.0 * (double) (done + (size_t) d - from) / ms : 0.0, P.request_pos(from));
             std::fflush(stdout);
         });
         // (DS4_LAST_WINDOW=1: the last token in a window of its own after the checkpoint, as before - for A/B runs)
@@ -1324,8 +1451,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
             if (ok && (done >= next_pp || done == total)) {
                 const double ms = now_ms() - t0;
-                std::printf("PP%s %zu %zu %.1f %.1f %zu\n", tag.c_str(), done, r.ids.size(), ms,
-                            ms > 0 ? 1000.0 * (double) (done - from) / ms : 0.0, from);
+                std::printf("PP%s %zu %zu %.1f %.1f %zu\n", tag.c_str(), P.request_pos(done),
+                            P.request_pos(r.ids.size()), ms,
+                            ms > 0 ? 1000.0 * (double) (done - from) / ms : 0.0, P.request_pos(from));
                 std::fflush(stdout);
                 next_pp = done + 64;
             }
@@ -1344,15 +1472,15 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
             std::fprintf(stderr, "ds4 serve: stopped while reading the prompt of %zu tokens, after %.0f ms%s\n",
                          total, now_ms() - t0, back ? "; the conversation before it is kept" : "");
-            std::printf("DONE%s 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0\n", tag.c_str(), r.ids.size(), now_ms() - t0,
-                        back ? from : (size_t) 0);
+            std::printf("DONE%s 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0\n", tag.c_str(), P.request_pos(r.ids.size()), now_ms() - t0,
+                        back ? P.request_pos(from) : (size_t) 0);
             std::fflush(stdout);
             return false;
         }
         if (!ok) {
             std::fprintf(stderr, "ds4: %s\n", err.c_str());
             std::printf("ERR%s %s\n", tag.c_str(), err.c_str());
-            std::printf("DONE%s 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", tag.c_str(), r.ids.size());
+            std::printf("DONE%s 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", tag.c_str(), P.request_pos(r.ids.size()));
             std::fflush(stdout);
             m.reset();
             return false;
@@ -1490,8 +1618,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         // (a request that ended on an ERR line - the NaN stop above - is over with that line: a DONE after it would be read by the
         //  next request as its own, and every answer after it would arrive one request late)
         if (!nan_stop) {
-            std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0\n", produced, r.ids.size(), t1 - t0, t2 - t1, finish,
-                        d_acc, d_off, from);
+            std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0\n", produced, P.request_pos(r.ids.size()), t1 - t0, t2 - t1, finish,
+                        d_acc, d_off, P.request_pos(from));
             std::fflush(stdout);
         }
         const auto& s = m.stats();
@@ -1579,8 +1707,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         };
         const auto finish_act = [&](Act& a) {
             const double t2 = now_ms();
-            std::printf("DONE %lld %lld %zu %.1f %.1f %s %lld %lld %zu 0 0\n", a.r.rid, a.produced, a.r.ids.size(),
-                        a.t1 - a.P.t0, t2 - a.t1, a.finish, a.d_acc, a.d_off, a.P.from);
+            std::printf("DONE %lld %lld %zu %.1f %.1f %s %lld %lld %zu 0 0\n", a.r.rid, a.produced, a.P.request_pos(a.r.ids.size()),
+                        a.t1 - a.P.t0, t2 - a.t1, a.finish, a.d_acc, a.d_off, a.P.request_pos(a.P.from));
             std::fflush(stdout);
             std::fprintf(stderr,
                          "maya ds4 serve: request %lld: prompt %zu tokens = %zu reused + %zu read in %.0f ms (%.1f tok/s), "
@@ -1836,6 +1964,16 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             // checkpoint it can go back to), else an empty one, else the least recently used
             int best = -1;
             int64_t best_u = -1;
+            int history_best = -1;
+            strata::ds4::ImageHistoryPlan best_history;
+            bool history_ambiguous = false;
+            const auto prefer_idle = [&](int s, int previous) {
+                if (previous < 0) return true;
+                const bool empty = m.seq_tokens(s).empty();
+                return empty != m.seq_tokens(previous).empty()
+                           ? empty
+                           : seq_used[(size_t) s] < seq_used[(size_t) previous];
+            };
             for (int s = 0; s < nseq; ++s) {
                 if (seq_rid[(size_t) s] >= 0) continue;
                 bind(s);
@@ -1846,12 +1984,22 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 int64_t u = 0;
                 if (!st.empty() && c == st.size() && st.size() < r.ids.size()) u = (int64_t) st.size();
                 else if (c > 0) u = std::max<int64_t>(0, m.restorable((int64_t) std::min(c, r.ids.size() - 1)));
-                const bool better = best < 0 || u > best_u ||
-                                    (u == best_u && (st.empty() != m.seq_tokens(best).empty()
-                                                         ? st.empty()
-                                                         : seq_used[(size_t) s] < seq_used[(size_t) best]));
-                if (better) best = s, best_u = u;
+                if (best < 0 || u > best_u || (u == best_u && prefer_idle(s, best))) best = s, best_u = u;
+                auto plan = history_match(r, images, m.tokens(), m.image_spans(), m.check_positions());
+                if (!plan.valid()) continue;
+                if (!best_history.valid() || plan.retained_tokens > best_history.retained_tokens) {
+                    best_history = std::move(plan);
+                    history_best = s;
+                    history_ambiguous = false;
+                } else if (plan.retained_tokens == best_history.retained_tokens) {
+                    if (!same_omissions(plan, best_history)) history_ambiguous = true;
+                    if (prefer_idle(s, history_best)) history_best = s;
+                }
             }
+            // Ambiguous forgotten identities must stay disabled when prompt_begin searches the cache tiers again.
+            if (history_ambiguous) r.allow_image_history = false;
+            else if (best_history.valid() && (int64_t) best_history.retained_tokens > best_u) best = history_best;
+            // Strict reuse wins equal scores; empty/LRU ordering is unchanged within each kind of match.
             if (best < 0) {   // (the server gives each conversation one request: a request over that waits)
                 waiting.push_front(ln);
                 return;
