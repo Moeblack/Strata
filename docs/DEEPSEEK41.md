@@ -145,23 +145,13 @@ on the card on a GPU that shares the PC's memory (Mac, GB10, Strix Halo), and wi
 tokens) and hands it to the engine; it needs Pillow for that (`python -m pip install pillow`; setup installs it). `--vision no` in `strata launch`
 (or `--vision off` for the engine) turns them off; a request with a picture then gets a 400 that says so.
 
-The DeepSeek C++ path keeps conversation history in the same RAM and directory slots. `STRATA_DS4_CONTEXT_HISTORY=images`
-(the default) allows several whole pictures to be omitted anywhere in the submitted history, not just at the start, and
-short caption or marker changes (up to 256 old text tokens skipped per edit). `fragments` also allows arbitrarily long old
-text or multimodal fragments to be omitted. Both modes tolerate short replacement or inserted history text of up to 256
-tokens. Matching uses exact 8-text-token chunks, picture identities as independent anchors, or a complete shorter tail
-block, preferring strong anchors and the earliest cached position; there is no fixed 32-token tail requirement.
-`0` requires strict prefix matching. An explicitly set new variable overrides the old `STRATA_DS4_IMAGE_HISTORY=0` switch;
-otherwise that switch still disables image-history retention. Unknown values fall back to strict matching, and
-`STRATA_DS4_REUSE=0` always disables reuse.
-
-This retains a conversation when a client stops sending old history or collapses it in the display; it does not make the
-model forget. The full evaluated causal KV state is retained, and hidden content still counts against the context limit.
-Short replacement or inserted history text is treated as a display annotation, not reevaluated at past model positions;
-the new suffix is still read normally. For actual deletion, rewriting, summary replacement or changed instructions that
-must affect the model, use strict matching and reread the affected suffix. KV state is never relocated or spliced into
-incompatible state. Ambiguity, no alignable block or insufficient capacity falls back to strict prefix matching or an
-existing checkpoint. These retention modes make no GPU compatibility or measured speedup claim.
+The DeepSeek C++ path takes a live conversation whole. When a request goes on from the conversation's latest answer,
+the engine keeps the conversation's entire state as it is and reads only what the request adds after that answer -
+whatever the client did to the earlier history: pruned old pictures, dropped reasoning, collapsed or rewrote turns.
+Those edits are not reconciled and do not make the model forget; the full state still counts against the context limit.
+A request that does not go on from the latest answer (a retry, an edit of the last message) goes back to the nearest
+restore point or a kept conversation instead, as before. A continuation that would not fit the context is read normally.
+`STRATA_DS4_REUSE=0` turns all reuse off.
 
 Each parallel conversation keeps its own picture identities. Slots store these identities with the model state, not the
 picture embeddings. The image-aware slot format replaces older slots; the first request after upgrading reads those
