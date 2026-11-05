@@ -2009,7 +2009,6 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             int64_t best_u = -1;
             int history_best = -1;
             strata::ds4::ContextHistoryPlan best_history;
-            bool history_ambiguous = false;
             const auto prefer_idle = [&](int s, int previous) {
                 if (previous < 0) return true;
                 const bool empty = m.seq_tokens(s).empty();
@@ -2031,11 +2030,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 if (!best_history.valid() || plan.retained_tokens() > best_history.retained_tokens()) {
                     best_history = std::move(plan);
                     history_best = s;
-                    history_ambiguous = false;
                 } else if (plan.retained_tokens() == best_history.retained_tokens()) {
-                    // Recency cannot establish which hidden image history the
-                    // client meant. Equal visible scores must agree causally.
-                    if (!plan.same_history(best_history)) history_ambiguous = true;
                     if (prefer_idle(s, history_best)) {
                         history_best = s;
                         best_history = std::move(plan);
@@ -2044,7 +2039,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
             // Keep the chosen plan; binding the sequence must not repeat matching.
             a->P.history_selected = true;
-            if (!history_ambiguous && best_history.valid() && (int64_t) best_history.retained_tokens() > best_u) {
+            if (best_history.valid() && (int64_t) best_history.retained_tokens() > best_u) {
                 best = history_best;
                 a->P.history = std::move(best_history);
             }
