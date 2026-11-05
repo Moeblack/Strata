@@ -28,37 +28,44 @@ inline int latest_point(const std::vector<int64_t>& at, int64_t limit, int64_t p
     return b;
 }
 
-// a restore point a prompt's read keeps: where, and whether it is the shared start (kept before the others)
+// A semantic point (user/image boundary or shared preamble) is exact: proximity
+// coalescing must never move it past an image or into a different turn.
 struct MarkAt {
     int64_t pos = 0;
     bool shared = false;
+    bool exact = false;
 };
 
-// The restore points the read of a prompt's tokens [from, total) keeps, in order, from the positions a request asks
-// for (`asked`, and `shared`: -1 none): those the read starts at or goes past - from `from` (the state there, kept
-// before the read) to short of the prompt's last token (checkpoint 1 keeps the state before it).  One inside a
-// picture's span (`spans`: start, length) is moved to the span's start (a span is read whole); one fewer than `gap`
-// tokens past `from` is kept at `from` (no read of its own for a few tokens), and of two fewer than `gap` apart the
-// first is kept, with the second's role too.  At most `cap`: the shared start first, then the latest.
+// Points reached by a read of [from, total), excluding the prompt's last token
+// (checkpoint 1 keeps the state before it). Explicit `asked` marks inside a
+// picture move to its start; optional nearby marks may coalesce with each other
+// or with `from`. Image starts, User starts and the shared preamble are exact.
+// At most `cap` points survive: shared starts first, then the latest.
 inline std::vector<MarkAt> mark_plan(const std::vector<int64_t>& asked, int64_t shared, int64_t from, int64_t total,
                                      int cap, int64_t gap,
-                                     const std::vector<std::pair<int64_t, int64_t>>& spans = {}) {
+                                     const std::vector<std::pair<int64_t, int64_t>>& spans = {},
+                                     const std::vector<int64_t>& user_starts = {}, int64_t preamble_end = -1) {
     std::vector<MarkAt> v;
     if (cap <= 0 || from < 0 || total - from < 2) return v;
-    const auto add = [&](int64_t p, bool sh) {
+    const auto add = [&](int64_t p, bool sh, bool exact = false) {
         for (const auto& s : spans)
-            if (p > s.first && p < s.first + s.second) p = s.first;
+            if (p > s.first && p - s.first < s.second) p = s.first;
         if (p < from || p >= total - 1) return;
-        if (p - from < gap) p = from;
-        v.push_back({p, sh});
+        if (!exact && p - from < gap) p = from;
+        v.push_back({p, sh, exact});
     };
     for (int64_t p : asked) add(p, false);
-    if (shared >= 0) add(shared, true);
+    if (shared >= 0) add(shared, true, true);
+    for (const auto& span : spans) add(span.first, false, true);
+    for (int64_t p : user_starts) add(p, false, true);
+    if (preamble_end > 0) add(preamble_end, true, true);
     std::stable_sort(v.begin(), v.end(), [](const MarkAt& a, const MarkAt& b) { return a.pos < b.pos; });
     std::vector<MarkAt> out;
     for (const MarkAt& m : v) {
-        if (!out.empty() && m.pos - out.back().pos < std::max<int64_t>(gap, 1)) {
+        if (!out.empty() && (m.pos == out.back().pos ||
+            (!m.exact && !out.back().exact && m.pos - out.back().pos < std::max<int64_t>(gap, 1)))) {
             out.back().shared = out.back().shared || m.shared;
+            out.back().exact = out.back().exact || m.exact;
             continue;
         }
         out.push_back(m);
