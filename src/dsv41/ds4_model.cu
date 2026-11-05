@@ -7548,33 +7548,113 @@ struct Model::Impl {
         return n;
     }
 
-    bool restore(int64_t limit, std::string* err = nullptr) {
-        const auto copied = [&](cudaError_t status) {
-            if (status == cudaSuccess) return true;
-            if (err != nullptr) *err = std::string("checkpoint restore: ") + cudaGetErrorString(status);
-            return false;
+    // Undo only the bytes a restore overwrites, on every replica (not a serialized conversation).
+    // A checked cold load and its checkpoint rewind share this journal, so rings are saved once.
+    struct RestoreTxn {
+        struct Undo {
+            int device;
+            void* dst;
+            std::vector<uint8_t> bytes;
+            bool dirty = false;
         };
+        Impl& p;
+        std::vector<Undo> undo;
+        bool done = false;
+
+        explicit RestoreTxn(Impl& model) : p(model) { sync(); }
+        RestoreTxn(const RestoreTxn&) = delete;
+        RestoreTxn& operator=(const RestoreTxn&) = delete;
+        ~RestoreTxn() { rollback(); }
+
+        [[noreturn]] static void fatal(const char* operation, cudaError_t status) noexcept {
+            std::fprintf(stderr, "ds4: unrecoverable restore %s: %s; model state is unusable\n",
+                         operation, cudaGetErrorString(status));
+            std::fflush(stderr);
+            std::abort();
+        }
+        void sync() noexcept {
+            // Include default/copy streams, not just the compute stream. Never stop draining at
+            // the first failed GPU: pending DMA must not outlive either its source or the undo data.
+            cudaError_t first = cudaSuccess;
+            for (const Dev& d : p.devs) {
+                cudaError_t status = cudaSetDevice(d.id);
+                if (status == cudaSuccess) status = cudaDeviceSynchronize();
+                if (first == cudaSuccess && status != cudaSuccess) first = status;
+            }
+            if (first != cudaSuccess) fatal("synchronization", first);
+        }
+        bool copy(int device, void* dst, const void* src, size_t bytes, std::string* err) {
+            if (bytes == 0) return true;
+            const auto checked = [&](cudaError_t status) {
+                if (status == cudaSuccess) return true;
+                if (err != nullptr) *err = std::string("restore transfer: ") + cudaGetErrorString(status);
+                return false;
+            };
+            Dev& d = p.devs[(size_t) device];
+            if (!checked(cudaSetDevice(d.id))) return false;
+            Undo* saved = nullptr;
+            for (Undo& u : undo)
+                if (u.device == device && u.dst == dst && u.bytes.size() >= bytes) {
+                    saved = &u;
+                    break;
+                }
+            if (saved == nullptr) {
+                undo.push_back({device, dst, std::vector<uint8_t>(bytes), false});
+                saved = &undo.back();
+                // A blocking D2H copy keeps allocation/exception paths free of borrowed host buffers.
+                // Earlier writes use the same stream; synchronize it before reading overlapping ranges.
+                if (!checked(cudaStreamSynchronize(d.st)) ||
+                    !checked(cudaMemcpy(saved->bytes.data(), dst, bytes, cudaMemcpyDeviceToHost))) return false;
+            }
+            saved->dirty = true;   // a failed enqueue is not assumed to have left the destination intact
+            return checked(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, d.st));
+        }
+        void commit() noexcept { done = true; }   // only after sync() and a nonthrowing host commit
+        void rollback() noexcept {
+            if (done) return;
+            sync();   // every device finishes the attempted restore BEFORE any undo is enqueued
+            cudaError_t first = cudaSuccess;
+            for (auto it = undo.rbegin(); it != undo.rend(); ++it) {
+                if (!it->dirty) continue;
+                Dev& d = p.devs[(size_t) it->device];
+                cudaError_t status = cudaSetDevice(d.id);
+                if (status == cudaSuccess)
+                    status = cudaMemcpyAsync(it->dst, it->bytes.data(), it->bytes.size(), cudaMemcpyHostToDevice, d.st);
+                if (first == cudaSuccess && status != cudaSuccess) first = status;
+            }
+            sync();   // also drain successful undo copies when another device's undo failed
+            if (first != cudaSuccess) fatal("rollback", first);
+            done = true;
+        }
+    };
+
+    bool restore(int64_t limit, std::string* err = nullptr, RestoreTxn* transaction = nullptr) {
         const int b = best_check(limit);
         if (b < 0) return false;
         const Check& c = check_at(b);
-        if (image_prefix(spans, spans, c.pos) != c.pos) return false;
+        if (image_prefix(spans, spans, c.pos) != c.pos || c.pos < 0 ||
+            (size_t) c.pos > toks.size() || (size_t) c.pos > ctoks.size() ||
+            c.win.size() != L.size() || c.comp.size() != L.size() * 2) return false;
+        for (size_t i = 0; i < L.size(); ++i) {
+            const size_t cn = L[i].c_kv ? (size_t) L[i].ratio * g.hd : 0;
+            if (c.win[i].size() != (size_t) g.win * win_rb() ||
+                c.comp[2 * i].size() != cn || c.comp[2 * i + 1].size() != cn) return false;
+        }
+        std::unique_ptr<RestoreTxn> owned;
+        if (transaction == nullptr) {
+            owned = std::make_unique<RestoreTxn>(*this);
+            transaction = owned.get();
+        }
         for (size_t i = 0; i < L.size(); ++i)
             for (int m = 0; m < L[i].nm; ++m) {   // (a group's members hold the same state: the lead's copy)
                 Layer& l = member(L[i], m);
-                Dev& d = devs[(size_t) l.dev];
-                if (!copied(cudaSetDevice(d.id)) ||
-                    !copied(cudaMemcpyAsync(l.win, c.win[i].data(), c.win[i].size(), cudaMemcpyHostToDevice, d.st)))
+                if (!transaction->copy(l.dev, l.win, c.win[i].data(), c.win[i].size(), err)) return false;
+                if (l.c_kv &&
+                    (!transaction->copy(l.dev, l.c_kv, c.comp[2 * i].data(), c.comp[2 * i].size() * 4, err) ||
+                     !transaction->copy(l.dev, l.c_score, c.comp[2 * i + 1].data(), c.comp[2 * i + 1].size() * 4, err)))
                     return false;
-                if (l.c_kv) {
-                    if (!copied(cudaMemcpyAsync(l.c_kv, c.comp[2 * i].data(), c.comp[2 * i].size() * 4,
-                                                cudaMemcpyHostToDevice, d.st)) ||
-                        !copied(cudaMemcpyAsync(l.c_score, c.comp[2 * i + 1].data(), c.comp[2 * i + 1].size() * 4,
-                                                cudaMemcpyHostToDevice, d.st))) return false;
-                }
             }
-        for (Dev& d : devs) {
-            if (!copied(cudaSetDevice(d.id)) || !copied(cudaStreamSynchronize(d.st))) return false;
-        }
+        transaction->sync();
         pos = c.pos;
         toks.resize((size_t) pos);
         ctoks.resize((size_t) pos);
@@ -7588,6 +7668,7 @@ struct Model::Impl {
         mk.erase(std::remove_if(mk.begin(), mk.end(), [this](const Check& x) { return x.pos > pos; }), mk.end());
         for (Check& x : mk)   // (a mark gone back to: in use)
             if (x.pos == pos) x.used = ++mark_clock;
+        if (owned) transaction->commit();
         return true;
     }
 
@@ -7776,19 +7857,9 @@ struct Model::Impl {
         return (uint64_t) off;
     }
 
-    bool slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err) {
+    bool slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err,
+                   RestoreTxn* transaction = nullptr) {
         size_t off = 0;
-        bool wrote = false, ok = false;
-        // a load that stops after some of another conversation's state went into the layers leaves a state no
-        // checkpoint can repair: it is reset (the prompt is read from token 0), never served from the mix
-        struct FailClosed {
-            Impl& p;
-            const bool& wrote;
-            const bool& ok;
-            ~FailClosed() {
-                if (!ok && wrote) p.reset();
-            }
-        } guard{*this, wrote, ok};
         const auto room = [&](size_t b) { return b <= bytes && off <= bytes - b; };
         uint64_t magic = 0, il = 0, n = 0;
         if (!room(16)) {
@@ -7896,22 +7967,13 @@ struct Model::Impl {
             return false;
         }
         off = state_off;
-        for (Dev& d : devs) {   // (their work ends before the state is written over)
-            const cudaError_t selected = cudaSetDevice(d.id);
-            const cudaError_t synced = selected == cudaSuccess ? cudaStreamSynchronize(d.st) : selected;
-            if (synced != cudaSuccess) {
-                err = std::string("slot load synchronization: ") + cudaGetErrorString(synced);
-                return false;
-            }
+        std::unique_ptr<RestoreTxn> owned;
+        if (transaction == nullptr) {
+            owned = std::make_unique<RestoreTxn>(*this);
+            transaction = owned.get();
         }
         for (size_t i = 0; i < L.size(); ++i) {
             Layer& l = L[i];
-            const Dev& d = devs[(size_t) l.dev];
-            const cudaError_t selected = cudaSetDevice(d.id);
-            if (selected != cudaSuccess) {
-                err = std::string("slot load device: ") + cudaGetErrorString(selected);
-                return false;
-            }
             uint64_t wb = 0, cn = 0;
             if (!room(8)) {
                 err = "the slot is cut short";
@@ -7923,15 +7985,9 @@ struct Model::Impl {
                 err = l.name + "window ring of another size";
                 return false;
             }
-            wrote = true;
             for (int m = 0; m < l.nm; ++m) {
                 Layer& lm = member(l, m);
-                // A tensor-parallel group's members sit on different GPUs.
-                if (cudaSetDevice(devs[(size_t) lm.dev].id) != cudaSuccess ||
-                    cudaMemcpy(lm.win, data + off, (size_t) wb, cudaMemcpyHostToDevice) != cudaSuccess) {
-                    err = l.name + "window ring: " + cudaGetErrorString(cudaGetLastError());
-                    return false;
-                }
+                if (!transaction->copy(lm.dev, lm.win, data + off, (size_t) wb, &err)) return false;
             }
             off += (size_t) wb;
             std::memcpy(&cn, data + off, 8);
@@ -7948,12 +8004,8 @@ struct Model::Impl {
                 }
                 for (int m = 0; m < l.nm; ++m) {
                     Layer& lm = member(l, m);
-                    if (cudaSetDevice(devs[(size_t) lm.dev].id) != cudaSuccess ||
-                        cudaMemcpy(lm.c_kv, data + off, cb, cudaMemcpyHostToDevice) != cudaSuccess ||
-                        cudaMemcpy(lm.c_score, data + off + cb, cb, cudaMemcpyHostToDevice) != cudaSuccess) {
-                        err = l.name + "compressor's group: " + cudaGetErrorString(cudaGetLastError());
-                        return false;
-                    }
+                    if (!transaction->copy(lm.dev, lm.c_kv, data + off, cb, &err) ||
+                        !transaction->copy(lm.dev, lm.c_score, data + off + cb, cb, &err)) return false;
                 }
                 off += 2 * cb;
             }
@@ -7978,20 +8030,8 @@ struct Model::Impl {
             }
             for (size_t di = 0; di < devs.size(); ++di) {
                 if (s.ckv[di] == nullptr && s.ik[di] == nullptr) continue;
-                const cudaError_t selected = cudaSetDevice(devs[di].id);
-                if (selected != cudaSuccess) {
-                    err = std::string("slot load device: ") + cudaGetErrorString(selected);
-                    return false;
-                }
-                if (s.ckv[di] != nullptr && cudaMemcpy(s.ckv[di], data + off, cb, cudaMemcpyHostToDevice) != cudaSuccess) {
-                    err = "source layer " + std::to_string(s.layer) + "'s compressed KV: " + cudaGetErrorString(cudaGetLastError());
-                    return false;
-                }
-                if (s.ik[di] != nullptr &&
-                    cudaMemcpy(s.ik[di], data + off + cb, ib, cudaMemcpyHostToDevice) != cudaSuccess) {
-                    err = "source layer " + std::to_string(s.layer) + "'s index keys: " + cudaGetErrorString(cudaGetLastError());
-                    return false;
-                }
+                if (s.ckv[di] != nullptr && !transaction->copy((int) di, s.ckv[di], data + off, cb, &err)) return false;
+                if (s.ik[di] != nullptr && !transaction->copy((int) di, s.ik[di], data + off + cb, ib, &err)) return false;
             }
             off += cb + ib;
         }
@@ -8059,24 +8099,31 @@ struct Model::Impl {
             err = "the slot does not end where it should";
             return false;
         }
+        // Finish all allocations before touching host state. An exception here still rolls back every GPU.
+        std::vector<int32_t> ctoks_in((size_t) n_pos);
+        for (size_t i = 0; i < ctoks_in.size(); ++i) {
+            const int tk = toks_in[i];
+            ctoks_in[i] = tk == img_tok && span_contains(spans_in, (int64_t) i) ? -1 :
+                          tk < pk.eg_vocab ? pk.eg_map[(size_t) tk] : 0;
+        }
+        uint64_t clock_in = mark_clock;
+        for (Check& x : got_mk) x.used = ++clock_in;
+        while ((int) got_mk.size() > marks_cap()) {
+            std::vector<MarkUse> u;
+            for (const Check& x : got_mk) u.push_back({x.pos, x.shared, x.used});
+            got_mk.erase(got_mk.begin() + mark_victim(u));
+        }
+        transaction->sync();
         pos = n_pos;
         toks.swap(toks_in);
-        spans = std::move(spans_in);
+        ctoks.swap(ctoks_in);
+        spans.swap(spans_in);
         imgs.clear();
-        ctoks.resize((size_t) pos);
-        for (size_t i = 0; i < (size_t) pos; ++i)
-            ctoks[i] = ctok((int64_t) i, toks[i]);
-        for (int k = 0; k < 3; ++k) ck[k] = std::move(got[k]);   // (the slot's own; the old ones held the state
-                                                               // this one replaced)
-        mk = std::move(got_mk);
-        for (Check& x : mk) x.used = ++mark_clock;   // (in the slot's order; past this engine's cap, the ones
-        while ((int) mk.size() > marks_cap()) {       //  mark_victim() picks go)
-            std::vector<MarkUse> u;
-            for (const Check& x : mk) u.push_back({x.pos, x.shared, x.used});
-            mk.erase(mk.begin() + mark_victim(u));
-        }
+        for (int k = 0; k < 3; ++k) ck[k] = std::move(got[k]);
+        mk.swap(got_mk);
+        mark_clock = clock_in;
         slot_held = false;
-        ok = true;
+        if (owned) transaction->commit();
         return true;
     }
 
@@ -8091,15 +8138,9 @@ struct Model::Impl {
             return false;
         }
 
-        // Serialize device state without slot_save's already-held shortcut or its held-state side effect.
-        // Nothing has been changed if this read-only backup fails.
-        std::vector<uint8_t> backup;
-        if (pos > 0 && slot_save(backup, err, -1, true) == 0) {
-            err = "cannot back up the live conversation: " + err;
-            return false;
-        }
-        // Slots omit embeddings, future spans, invalid checkpoints and exact mark LRU clocks. Keep all
-        // host state separately, moving (not duplicating) the potentially large checkpoint buffers.
+        RestoreTxn transaction(*this);
+        // Keep exact host state without duplicating checkpoint buffers. The shared device journal
+        // covers both the cold load and its rewind, including an originally empty conversation.
         SeqState original;
         original.pos = pos;
         original.toks = std::move(toks);
@@ -8111,21 +8152,8 @@ struct Model::Impl {
         original.mark_clock = mark_clock;
         original.slot_held = slot_held;
 
-        const auto rollback = [&]() {
-            std::string rollback_err;
-            try {
-                if (original.pos > 0) {
-                    if (!slot_load(backup.data(), backup.size(), original.pos, rollback_err))
-                        throw std::runtime_error(rollback_err);
-                } else {
-                    reset();
-                }
-            } catch (const std::exception& failure) {
-                throw std::runtime_error(std::string("unrecoverable slot rollback failure; model state is unusable: ") +
-                                         failure.what());
-            } catch (...) {
-                throw std::runtime_error("unrecoverable slot rollback failure; model state is unusable");
-            }
+        const auto rollback = [&]() noexcept {
+            transaction.rollback();
             pos = original.pos;
             toks = std::move(original.toks);
             ctoks = std::move(original.ctoks);
@@ -8138,7 +8166,7 @@ struct Model::Impl {
         };
 
         try {
-            if (slot_load(data, bytes, n_pos, err)) {
+            if (slot_load(data, bytes, n_pos, err, &transaction)) {
                 const bool same_images = spans.size() == expected_images.size() &&
                     std::equal(spans.begin(), spans.end(), expected_images.begin(), [](const ImageSpan& a, const ImageSpan& b) {
                         return a.start == b.start && a.len == b.len && a.hash == b.hash;
@@ -8146,10 +8174,12 @@ struct Model::Impl {
                 if (toks != expected_tokens || !same_images) {
                     err = "the slot's tokens or images do not match the selected metadata";
                 } else if (restore_to == n_pos) {
+                    transaction.commit();
                     return true;
                 } else if (restorable(restore_to) != restore_to) {
                     err = "the selected slot has no checkpoint at the requested restore position";
-                } else if (restore(restore_to, &err) && pos == restore_to) {
+                } else if (restore(restore_to, &err, &transaction) && pos == restore_to) {
+                    transaction.commit();
                     return true;
                 } else if (err.empty()) {
                     err = "the selected slot could not restore the requested checkpoint";

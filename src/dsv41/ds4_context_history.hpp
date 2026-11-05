@@ -5,15 +5,12 @@
 
 #include <functional>
 #include <limits>
-#include <unordered_map>
 #include <utility>
 
 namespace strata::ds4 {
 
 // Historical presentation folds preserve the original causal model positions.
 // Global cache reuse is controlled by the caller, not a modality-specific policy.
-inline constexpr size_t context_history_anchor_tokens = 8;
-inline constexpr size_t context_history_annotation_tokens = 256;
 
 namespace context_history_detail {
 
@@ -78,8 +75,6 @@ public:
         hashes_.assign(1, {});
         powers_.assign(1, {1, 1});
         text_counts_.assign(1, 0);
-        keys_.clear();
-        positions_.clear();
         size_ = 0;
         valid_ = false;
     }
@@ -93,8 +88,7 @@ public:
 
     // The caller guarantees that the existing common token/metadata prefix has
     // not changed. Only new tokens and images are checked; a shorter sequence
-    // removes its suffix, including obsolete anchor positions. At most seven
-    // surviving tail windows need rebuilding on either append or truncation.
+    // removes its suffix.
     void extend(const std::vector<int32_t>& tokens, const std::vector<ImageSpan>& images,
                 int image_token) {
         if (tokens.size() > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
@@ -116,17 +110,6 @@ public:
                 clear();
                 return;
             }
-        }
-        const size_t rebuild = keep > context_history_anchor_tokens - 1
-            ? keep - (context_history_anchor_tokens - 1) : 0;
-        if (index_anchors_) {
-            for (size_t i = keys_.size(); i > rebuild; --i) {
-                const auto& key = keys_[i - 1];
-                erase_last(key);
-                if (key.count > 1 && atoms_[i + key.count - 2].image)
-                    erase_last({range(i - 1, i + key.count - 2), key.count - 1});
-            }
-            keys_.resize(rebuild);
         }
         atoms_.resize(keep);
         hashes_.resize(keep + 1);
@@ -179,18 +162,6 @@ public:
         }
         size_ = tokens.size();
         valid_ = true;
-        if (index_anchors_) {
-            for (size_t i = rebuild; i < atoms_.size(); ++i) {
-                const auto key = anchor(i, atoms_.size());
-                keys_.push_back(key);
-                positions_[key].push_back(i);
-                // A short retained run between independently omitted pictures
-                // must not require the following picture to remain visible.
-                // Index that text-only boundary as a weaker anchor as well.
-                if (key.count > 1 && atoms_[i + key.count - 1].image)
-                    positions_[{range(i, i + key.count - 1), key.count - 1}].push_back(i);
-            }
-        }
     }
 
     bool valid() const { return valid_; }
@@ -244,56 +215,7 @@ public:
         return token_position(common_atoms(0, atom_count(), other, 0));
     }
 
-    std::pair<size_t, size_t> find_anchor(size_t begin, size_t end, size_t limit,
-                                       const ContextHistoryIndex& request, size_t incoming) const {
-        std::pair<size_t, size_t> best{npos, npos};
-        size_t strength = 0;
-        // Only the bounded annotation is walked. Each key performs one position
-        // lower_bound, never a scan through repeated matches in a long history.
-        for (size_t at = incoming; at < request.atom_count(); ++at) {
-            const auto longest = request.anchor(at, request.atom_count());
-            for (size_t count = longest.count; count != 0; --count) {
-                const Key key{request.range(at, at + count), count};
-                size_t candidate = npos;
-                const auto found = positions_.find(key);
-                if (found != positions_.end()) {
-                    const auto pos = std::lower_bound(found->second.begin(), found->second.end(), begin);
-                    if (pos != found->second.end() && *pos <= end && count <= limit - *pos)
-                        candidate = *pos;
-                }
-                // A checkpoint has a virtual short tail not present in the
-                // full-sequence anchor table. There is only one possible tail
-                // for each width, so checking it never scans cached candidates.
-                if (count < context_history_anchor_tokens && count <= limit) {
-                    const size_t tail = limit - count;
-                    if (tail >= begin && tail <= end && tail < candidate &&
-                        anchor(tail, limit) == key) candidate = tail;
-                }
-                if (candidate == npos) continue;
-                const size_t score = request.atom(at + count - 1).image
-                    ? context_history_anchor_tokens : count;
-                if (score > strength || (score == strength && candidate < best.first)) {
-                    best = {candidate, at};
-                    strength = score;
-                }
-                if (best.first == begin && strength == context_history_anchor_tokens) return best;
-            }
-            if (at - incoming == context_history_annotation_tokens || request.atom(at).image) break;
-        }
-        return best;
-    }
-
 private:
-    struct Key {
-        Fingerprint hash;
-        size_t count;
-        bool operator==(const Key& other) const { return count == other.count && hash == other.hash; }
-    };
-    struct KeyHash {
-        size_t operator()(const Key& key) const {
-            return static_cast<size_t>(key.hash.first ^ (key.hash.second << 1) ^ key.count);
-        }
-    };
     static constexpr uint64_t base_first = 0x9e3779b185ebca87ULL;
     static constexpr uint64_t base_second = 0xc2b2ae3d27d4eb4fULL;
 
@@ -307,26 +229,11 @@ private:
         return {mix(atom.identity ^ kind) + mix(atom.width ^ base_first),
                 mix(atom.identity + kind) + mix(atom.width ^ base_second)};
     }
-    Key anchor(size_t begin, size_t end) const {
-        size_t next = begin;
-        while (next < end && next - begin < context_history_anchor_tokens) {
-            if (atoms_[next++].image) break;
-        }
-        return {range(begin, next), next - begin};
-    }
-    void erase_last(const Key& key) {
-        auto found = positions_.find(key);
-        // Tail maintenance visits source positions in descending order.
-        found->second.pop_back();
-        if (found->second.empty()) positions_.erase(found);
-    }
 
     std::vector<context_history_detail::Atom> atoms_;
     std::vector<Fingerprint> hashes_;
     std::vector<Fingerprint> powers_;
     std::vector<size_t> text_counts_;
-    std::vector<Key> keys_;
-    std::unordered_map<Key, std::vector<size_t>, KeyHash> positions_;
     size_t size_ = 0;
     int image_token_ = 0;
     bool valid_ = false;
@@ -411,6 +318,35 @@ private:
 
 namespace context_history_detail {
 
+// A short picture description is accepted only with exact evidence from the
+// text immediately after that picture slot. Never search ahead in cached text.
+template <typename RequestAtom>
+inline size_t image_slot_resume(const ContextHistoryIndex& source, size_t after_images,
+                                size_t source_end, size_t incoming, size_t request_count,
+                                const RequestAtom& request_atom) {
+    constexpr size_t evidence_limit = 8;
+    constexpr size_t description_limit = 256;
+    if (after_images >= source_end) return ContextHistoryIndex::npos;
+    size_t evidence = 0;
+    while (evidence < evidence_limit && evidence < source_end - after_images &&
+           !source.atom(after_images + evidence).image) ++evidence;
+    if (evidence == 0) return ContextHistoryIndex::npos;
+    size_t resume = ContextHistoryIndex::npos;
+    for (size_t at = incoming; at <= request_count; ++at) {
+        if (request_count - at < evidence) break;
+        size_t equal = 0;
+        while (equal < evidence && source.atom(after_images + equal) == request_atom(at + equal))
+            ++equal;
+        if (equal == evidence) {
+            // Repeated adjacent-text matches do not identify a unique slot end.
+            if (resume != ContextHistoryIndex::npos) return ContextHistoryIndex::npos;
+            resume = at;
+        }
+        if (at - incoming == description_limit || request_atom(at).image) break;
+    }
+    return resume;
+}
+
 inline void append_edit(std::vector<HistoryEdit>& edits, size_t begin, size_t end,
                         size_t incoming, size_t incoming_end) {
     if (!edits.empty() && edits.back().model_begin + edits.back().model_length == begin &&
@@ -424,10 +360,9 @@ inline void append_edit(std::vector<HistoryEdit>& edits, size_t begin, size_t en
 
 }  // namespace context_history_detail
 
-// Project a client-visible history onto a complete restorable causal prefix.
-// Short replacement/annotation text between retained chunks is a presentation
-// edit, not a new instruction to evaluate in the past. Newly appended content
-// is always evaluated normally. No KV is spliced or rebased.
+// Project whole-image omissions or evidenced short picture descriptions onto
+// their original slots. Outside those slots text must match exactly; retain only
+// the proven prefix on mismatch and evaluate the remaining request normally.
 inline ContextHistoryPlan reconcile_context_history(const std::vector<int32_t>& cached,
                                                     const std::vector<ImageSpan>& cached_images,
                                                     const ContextHistoryIndex& cached_index,
@@ -459,25 +394,25 @@ inline ContextHistoryPlan reconcile_context_history(const std::vector<int32_t>& 
             continue;
         }
         const auto& previous = cached_index.atom(old);
-        const auto& next = request_index.atom(incoming);
-        const auto resume = cached_index.find_anchor(old, limit - 1, limit, request_index, incoming);
-        if (resume.first == ContextHistoryIndex::npos) {
-            // With no later retained anchor, the old tail is hidden uniformly:
-            // text, tool results and images are all historical model fragments.
-            // Require some retained evidence rather than adopting an unrelated
-            // source whose entire visible history has disappeared.
-            if (incoming == 0) return {};
-            append_edit(edits, previous.start, cached_limit, next.start, next.start);
-            old = limit;
-            continue;
+        if (!previous.image) break;
+        size_t after_images = old + 1;
+        while (after_images < limit && cached_index.atom(after_images).image) ++after_images;
+        const size_t resume = context_history_detail::image_slot_resume(
+            cached_index, after_images, limit, incoming, request_index.atom_count(),
+            [&](size_t at) -> const context_history_detail::Atom& { return request_index.atom(at); });
+        if (resume != ContextHistoryIndex::npos) {
+            append_edit(edits, previous.start, cached_index.token_position(after_images),
+                        request_index.token_position(incoming), request_index.token_position(resume));
+            old = after_images;
+            incoming = resume;
+        } else {
+            const size_t at = request_index.token_position(incoming);
+            append_edit(edits, previous.start, previous.start + previous.width, at, at);
+            ++old;
         }
-        if (resume.first == old && resume.second == incoming) return {};
-        append_edit(edits, previous.start, cached_index.token_position(resume.first),
-                    next.start, request_index.token_position(resume.second));
-        old = resume.first;
-        incoming = resume.second;
     }
     if (edits.empty() || incoming >= request_index.atom_count()) return {};
+    cached_limit = cached_index.token_position(old);
     const size_t retained = request_index.token_position(incoming);
     if (request.size() - retained > static_cast<uint64_t>(max_tokens) - cached_limit) return {};
     auto projection = HistoryProjection::make(std::move(edits), cached_limit, request.size(), retained);
@@ -485,8 +420,8 @@ inline ContextHistoryPlan reconcile_context_history(const std::vector<int32_t>& 
     return {std::move(projection), cached, cached_images, cached_index};
 }
 
-// Materialize only after choosing a cache source. Hidden text and image metadata
-// come from that exact evaluated prefix; omitted pixels are never synthesized or
+// Materialize only after choosing a cache source. Hidden image metadata comes
+// from that exact evaluated prefix; omitted pixels are never synthesized or
 // evaluated. Callers must restore and verify its KV before committing this prompt.
 using ContextHistoryRestorable = std::function<size_t(size_t)>;
 
@@ -554,19 +489,34 @@ inline bool apply_context_history(ContextHistoryPlan& plan, const std::vector<in
             exact = false;
             break;
         }
-        // Incoming images are never annotations, even if their placeholders
-        // happen to equal an omitted source image's placeholders.
-        for (size_t at = new_atom; at < new_end; ++at) {
-            if (checked[at].image) {
+        // Nonempty descriptions require a whole image-only slot followed by
+        // the same exact adjacent text evidence used during reconciliation.
+        if (edit.request_length != 0) {
+            bool image_only = old_atom < old_end;
+            for (size_t at = old_atom; at < old_end; ++at)
+                if (!source.atom_at(at).image) image_only = false;
+            const size_t resume = image_only ? context_history_detail::image_slot_resume(
+                source, old_end, source.atom_count(), new_atom, checked.size(),
+                [&](size_t at) -> const context_history_detail::Atom& { return checked[at]; })
+                : ContextHistoryIndex::npos;
+            if (resume != new_end) {
                 exact = false;
                 break;
             }
         }
-        if (!exact) break;
-        verified_edits.push_back(edit);
-        old_atom = old_end;
+        // Zero-length omissions still preserve any proven image-only prefix.
+        while (old_atom < old_end && source.atom_at(old_atom).image) {
+            model += source.atom_at(old_atom).width;
+            ++old_atom;
+        }
+        if (model > edit.model_begin)
+            verified_edits.push_back({edit.model_begin, model - edit.model_begin, incoming,
+                                      old_atom == old_end ? edit.request_length : 0});
+        if (old_atom != old_end) {
+            exact = false;
+            break;
+        }
         new_atom = new_end;
-        model = model_end;
         incoming = request_end;
     }
     if (exact) exact = equal_until(plan.cached_tokens(), plan.retained_tokens());

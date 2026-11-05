@@ -238,6 +238,8 @@ public:
     /// Keep the state at the current position in checkpoint slot 0 or 1 (the end of a prompt, the position before it);
     /// restore(limit) goes back to the latest one at or before limit (-1: none).
     void checkpoint(int slot = 0);
+    /// Recoverable failure leaves host and all devices unchanged; unrecoverable synchronization or rollback
+    /// failure aborts the process rather than allowing a partially restored model to be reused.
     bool restore(int64_t limit);
     int64_t restorable(int64_t limit) const;
     /// Checkpoint 1 also becomes the anchor (kept until a restore goes before it): the position before the end of the
@@ -261,10 +263,12 @@ public:
     uint64_t slot_save(std::vector<uint8_t>& out, std::string& err, int64_t at = -1);
     /// `data` (a slot's bytes) back into the model: the state at the slot's position n_pos, as slot_save took it -
     /// what a prompt that continues the slot's tokens reads on from (the caller checked the tokens are a prefix).
+    /// Recoverable failure leaves host and all devices unchanged; unrecoverable synchronization or rollback
+    /// failure aborts the process, as with restore().
     bool slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err);
     /// Load only the selected slot's exact tokens/images, then restore its endpoint or exact checkpoint restore_to.
     /// false leaves the original live sequence unchanged, even if it was already saved; err describes the miss.
-    /// Throws std::runtime_error if rollback fails: the model must not be used after that unrecoverable error.
+    /// Unrecoverable synchronization or rollback failure aborts the process; the model cannot be reused.
     bool slot_load_checked(const uint8_t* data, size_t bytes, int64_t n_pos, int64_t restore_to,
                            const std::vector<int32_t>& expected_tokens,
                            const std::vector<ImageSpan>& expected_images, std::string& err);

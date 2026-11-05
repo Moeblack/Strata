@@ -9,6 +9,7 @@
 #include <set>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace strata::ds4 {
 
@@ -23,8 +24,8 @@ namespace strata::ds4 {
 // There are at most two nodes per distinct endpoint, plus the root.
 //
 // Hash equality is only a candidate filter. Before loading a result, the caller
-// MUST verify that single source's token/image prefix exactly. A collision may
-// cause a missed reuse opportunity but must never cause an unverified restore.
+// MUST verify that source's token/image prefix exactly. Failed candidates may be
+// skipped without discarding other sources on the same matching radix path.
 // This class is not synchronized; readers and updates must be serialized.
 template <typename AtomKey, typename Fingerprint, typename Compare = std::less<AtomKey>>
 class ExactPrefixRadixIndex {
@@ -156,6 +157,29 @@ public:
             parent = &child;
         }
         return best;
+    }
+
+    // Snapshot all candidate IDs on the request's matching path. Callers rank
+    // equal-length sources using their own RAM/LRU metadata, then try shorter
+    // endpoints if needed. No cold metadata or unrelated branch is visited.
+    // The returned IDs remain safe to iterate while the caller updates the index.
+    template <typename PrefixHash, typename AtomAt>
+    std::vector<Match> find_candidates(size_t request_tokens, PrefixHash prefix_hash,
+                                       AtomAt atom_at, size_t floor = 0) const {
+        std::vector<Match> matches;
+        if (request_tokens == 0 || request_tokens - 1 <= floor) return matches;
+        const size_t ceiling = request_tokens - 1;
+        const Node* parent = &root_;
+        while (parent->length < ceiling) {
+            const auto edge = parent->children.find(atom_at(parent->length));
+            if (edge == parent->children.end()) break;
+            const Node& child = *edge->second;
+            if (child.length > ceiling || !(prefix_hash(child.length) == child.fingerprint)) break;
+            if (child.length > floor)
+                for (Id id : child.endpoints) matches.push_back({id, child.length, true});
+            parent = &child;
+        }
+        return matches;
     }
 
 private:
