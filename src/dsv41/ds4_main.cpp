@@ -11,8 +11,8 @@
 // <decode ms> <stop|length|cancel> 0 0 <reused> 0 0`; `STOP` ends a request early, `QUIT` the engine.  A prompt that
 // continues the state (the conversation so far) reuses it; one that only shares the last prompt's start goes back to
 // that prompt's end; anything else starts over.  `GENI <max_new> [keys] <file> <ids>` carries the prompt's pictures
-// (the file: see read_pics); matching leading image omissions retain the previous causal conditioning, rather than
-// removing it. STRATA_DS4_IMAGE_HISTORY=0 disables this reconciliation; otherwise pictures must match their positions.
+// (the file: see read_pics). Context-history projections retain omitted inputs at their original causal positions.
+// STRATA_DS4_CONTEXT_HISTORY=images|fragments|0 selects image retention, fragment retention, or strict matching.
 // STRATA_DS4_SLOT_KEEP=1 the conversations are kept when another one takes the model (a slot each: the state, the
 // compressed KV included), and across runs in STRATA_DS4_SLOT_DIR - so a request that does not continue the state but
 // does continue a kept conversation reads only its new tokens.
@@ -37,7 +37,7 @@
 #include "strata/platform/io_priority.hpp"
 #include "ds4_packinfo.hpp"
 #include "ds4_slotmeta.hpp"
-#include "ds4_image_history.hpp"
+#include "ds4_context_history.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -364,7 +364,7 @@ struct Req {
     int pen_n = 0;
     float pen_repeat = 1.0f, pen_freq = 0.0f, pen_present = 0.0f;
     std::string file;   // GENI: the pictures
-    bool allow_image_history = true;   // false when idle histories cannot identify the omitted pictures unambiguously
+    bool allow_context_history = true;  // false when idle histories cannot identify the causal history unambiguously
     std::vector<int> ids;
 };
 
@@ -566,10 +566,20 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     const bool slot_keep =
         std::getenv("STRATA_DS4_SLOT_KEEP") != nullptr && std::atoi(std::getenv("STRATA_DS4_SLOT_KEEP")) != 0;
     const bool reuse = std::getenv("STRATA_DS4_REUSE") == nullptr || std::atoi(std::getenv("STRATA_DS4_REUSE")) != 0;
-    // Omitted old pictures stay in the causal history, not in the incoming request.  No KV is moved or rebased.
-    // Disable for callers that require removing pictures to change the model's historical conditioning.
-    const bool image_history = reuse && (std::getenv("STRATA_DS4_IMAGE_HISTORY") == nullptr ||
-                                         std::atoi(std::getenv("STRATA_DS4_IMAGE_HISTORY")) != 0);
+    // Retention is not model forgetting: omitted inputs still occupy their causal KV positions and context budget.
+    // The new policy overrides the legacy image switch; unknown policies fail closed to strict matching.
+    using strata::ds4::ContextHistoryPolicy;
+    ContextHistoryPolicy context_history = ContextHistoryPolicy::disabled;
+    if (reuse) {
+        const char* policy = std::getenv("STRATA_DS4_CONTEXT_HISTORY");
+        if (policy != nullptr) {
+            if (std::string(policy) == "images") context_history = ContextHistoryPolicy::images;
+            else if (std::string(policy) == "fragments") context_history = ContextHistoryPolicy::fragments;
+        } else if (std::getenv("STRATA_DS4_IMAGE_HISTORY") == nullptr ||
+                   std::atoi(std::getenv("STRATA_DS4_IMAGE_HISTORY")) != 0) {
+            context_history = ContextHistoryPolicy::images;
+        }
+    }
     int slot_max = slot_keep ? std::max(0, (int) env_num("STRATA_DS4_SLOT_CAP", 4)) : 0;
     const size_t slot_min = (size_t) std::max(1.0, env_num("STRATA_DS4_SLOT_MIN", 1024));
     const double slot_days = env_num("STRATA_DS4_SLOT_DAYS", 7);
@@ -1035,34 +1045,28 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         }
         return out;
     };
-    const auto same_omissions = [](const strata::ds4::ImageHistoryPlan& a, const strata::ds4::ImageHistoryPlan& b) {
-        if (a.omitted.size() != b.omitted.size()) return false;
-        for (size_t i = 0; i < a.omitted.size(); ++i) {
-            const auto& x = a.omitted[i];
-            const auto& y = b.omitted[i];
-            if (x.start != y.start || x.len != y.len || x.hash != y.hash) return false;
-        }
-        return true;
-    };
-    // A plan only covers a complete restorable state.  Missing pictures are never
-    // synthesized for prefill: they must already be represented by that state's KV.
+    // A plan only covers a complete restorable state. Hidden multimodal fragments
+    // must already be represented by that state's KV; they are never re-prefilled.
     const auto history_match = [&](const Req& r, const std::vector<strata::ds4::ImageSpan>& images,
                                    const std::vector<int32_t>& tokens,
                                    const std::vector<strata::ds4::ImageSpan>& cached_images,
                                    const std::vector<int64_t>& checkpoints) {
-        strata::ds4::ImageHistoryPlan plan;
-        if (!image_history || !r.allow_image_history || cached_images.empty() || r.max_new > m.max_context()) return plan;
+        strata::ds4::ContextHistoryPlan plan;
+        if (context_history == ContextHistoryPolicy::disabled || !r.allow_context_history ||
+            (context_history == ContextHistoryPolicy::images && cached_images.empty()) ||
+            r.max_new > m.max_context()) return plan;
         const int64_t budget = m.max_context() - std::max(0LL, r.max_new);
-        plan = strata::ds4::reconcile_image_history(tokens, cached_images, r.ids, images, img_tok, budget);
+        plan = strata::ds4::reconcile_context_history(tokens, cached_images, r.ids, images, img_tok, budget, context_history);
         if (plan.valid()) return plan;
         std::vector<int64_t> points = checkpoints;
         std::sort(points.begin(), points.end(), std::greater<int64_t>());
         for (int64_t at : points) {
             if (at <= 0 || (uint64_t) at >= tokens.size()) continue;
-            plan = strata::ds4::reconcile_image_history(tokens, cached_images, r.ids, images, img_tok, budget, (size_t) at);
+            plan = strata::ds4::reconcile_context_history(tokens, cached_images, r.ids, images, img_tok, budget,
+                                                         context_history, (size_t) at);
             if (plan.valid()) return plan;
         }
-        return strata::ds4::ImageHistoryPlan{};
+        return strata::ds4::ContextHistoryPlan{};
     };
     // a request's prompt into the bound conversation (one conversation's requests and --parallel's alike): its
     // pictures read, the state it continues reused (in place, a checkpoint, or a kept conversation), the rest read.
@@ -1076,7 +1080,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         bool continued = false;  // (the conversation goes on - its anchor stays)
         bool pictures_ready = false;
         std::vector<Pic> pics;
-        strata::ds4::ImageHistoryPlan history;
+        strata::ds4::ContextHistoryPlan history;
         size_t request_tokens = 0;   // immutable wire length, before history expansion
         size_t request_pos(size_t pos) const {
             return std::min(request_tokens, history.valid() ? history.to_request(pos) : pos);
@@ -1126,23 +1130,23 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // commit the expanded prompt. A failed load leaves the original request intact.
     const auto history_take = [&](Req& r, std::vector<strata::ds4::ImageSpan>& images,
                                   Prompt& P, size_t floor, bool displaced, bool& continued) -> size_t {
-        if (!image_history || !r.allow_image_history) return 0;
+        if (context_history == ContextHistoryPolicy::disabled || !r.allow_context_history) return 0;
         enum class Source { current, slot, prefix };
         Source source = Source::current;
         size_t index = 0;
-        strata::ds4::ImageHistoryPlan best;
+        strata::ds4::ContextHistoryPlan best;
         bool ambiguous = false;
-        const auto consider = [&](strata::ds4::ImageHistoryPlan plan, Source kind, size_t at) {
-            if (!plan.valid() || plan.retained_tokens <= floor) return;
-            if (!best.valid() || plan.retained_tokens > best.retained_tokens) {
+        const auto consider = [&](strata::ds4::ContextHistoryPlan plan, Source kind, size_t at) {
+            if (!plan.valid() || plan.retained_tokens() <= floor) return;
+            if (!best.valid() || plan.retained_tokens() > best.retained_tokens()) {
                 best = std::move(plan);
                 source = kind;
                 index = at;
                 ambiguous = false;
-            } else if (plan.retained_tokens == best.retained_tokens) {
-                // Identical visible histories with different forgotten pictures
-                // cannot identify a conversation. Fall back rather than guess.
-                if (!same_omissions(plan, best)) ambiguous = true;
+            } else if (plan.retained_tokens() == best.retained_tokens()) {
+                // Equal visible projections do not identify different hidden
+                // causal histories. Compare their full content and identities.
+                if (!plan.same_history(best)) ambiguous = true;
             }
         };
         consider(history_match(r, images, m.tokens(), m.image_spans(), m.check_positions()), Source::current, 0);
@@ -1152,12 +1156,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             consider(history_match(r, images, prefixes[i].tokens, prefixes[i].images, {}), Source::prefix, i);
         if (!best.valid() || ambiguous) return 0;
         // A true continuation must not serialize its huge live state just because
-        // the client stopped transmitting old pixels. Other restores save it first.
-        if (!displaced && (source != Source::current || best.cached_tokens != m.tokens().size())) return 0;
+        // the client stopped transmitting old fragments. Other restores save it first.
+        if (!displaced && (source != Source::current || best.cached_tokens() != m.tokens().size())) return 0;
         std::vector<int> expanded;
         std::vector<strata::ds4::ImageSpan> expanded_images;
-        if (!strata::ds4::apply_image_history(best, r.ids, images, img_tok, expanded, expanded_images)) return 0;
-        const size_t resume = best.cached_tokens;
+        if (!strata::ds4::apply_context_history(best, r.ids, images, img_tok, expanded, expanded_images)) return 0;
+        const size_t resume = best.cached_tokens();
         bool loaded = false, whole = false;
         if (source == Source::current) {
             whole = resume == m.tokens().size();
@@ -1181,8 +1185,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         r.ids = std::move(expanded);
         images = std::move(expanded_images);
         continued = whole;
-        std::fprintf(stderr, "ds4: retained %zu historical pictures (%zu model tokens); reused %zu request tokens at model position %zu\n",
-                     best.omitted.size(), resume - best.retained_tokens, best.retained_tokens, resume);
+        std::fprintf(stderr, "ds4: projected %zu historical edits; covered %zu request tokens with %zu cached model tokens\n",
+                     best.projection().edits().size(), best.retained_tokens(), resume);
         P.history = std::move(best);
         return resume;
     };
@@ -1211,7 +1215,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             continued = true;
         }
         else {
-            // An exact cache wins ties; image retention must save additional visible
+            // An exact cache wins ties; context retention must save additional visible
             // prompt work. Compare all tiers before changing any request coordinates.
             size_t floor = (size_t) std::max<int64_t>(0, m.restorable((int64_t) std::min(c, r.ids.size() - 1)));
             const int exact_prefix = prefix_find(r.ids, images, floor);
@@ -1965,7 +1969,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             int best = -1;
             int64_t best_u = -1;
             int history_best = -1;
-            strata::ds4::ImageHistoryPlan best_history;
+            strata::ds4::ContextHistoryPlan best_history;
             bool history_ambiguous = false;
             const auto prefer_idle = [&](int s, int previous) {
                 if (previous < 0) return true;
@@ -1987,18 +1991,18 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 if (best < 0 || u > best_u || (u == best_u && prefer_idle(s, best))) best = s, best_u = u;
                 auto plan = history_match(r, images, m.tokens(), m.image_spans(), m.check_positions());
                 if (!plan.valid()) continue;
-                if (!best_history.valid() || plan.retained_tokens > best_history.retained_tokens) {
+                if (!best_history.valid() || plan.retained_tokens() > best_history.retained_tokens()) {
                     best_history = std::move(plan);
                     history_best = s;
                     history_ambiguous = false;
-                } else if (plan.retained_tokens == best_history.retained_tokens) {
-                    if (!same_omissions(plan, best_history)) history_ambiguous = true;
+                } else if (plan.retained_tokens() == best_history.retained_tokens()) {
+                    if (!plan.same_history(best_history)) history_ambiguous = true;
                     if (prefer_idle(s, history_best)) history_best = s;
                 }
             }
-            // Ambiguous forgotten identities must stay disabled when prompt_begin searches the cache tiers again.
-            if (history_ambiguous) r.allow_image_history = false;
-            else if (best_history.valid() && (int64_t) best_history.retained_tokens > best_u) best = history_best;
+            // Ambiguous causal histories must stay disabled when prompt_begin searches the cache tiers again.
+            if (history_ambiguous) r.allow_context_history = false;
+            else if (best_history.valid() && (int64_t) best_history.retained_tokens() > best_u) best = history_best;
             // Strict reuse wins equal scores; empty/LRU ordering is unchanged within each kind of match.
             if (best < 0) {   // (the server gives each conversation one request: a request over that waits)
                 waiting.push_front(ln);

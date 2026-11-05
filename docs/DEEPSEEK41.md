@@ -145,11 +145,27 @@ on the card on a GPU that shares the PC's memory (Mac, GB10, Strix Halo), and wi
 tokens) and hands it to the engine; it needs Pillow for that (`python -m pip install pillow`; setup installs it). `--vision no` in `strata launch`
 (or `--vision off` for the engine) turns them off; a request with a picture then gets a 400 that says so.
 
-Picture conversations use the same RAM and directory slots. A shared prefix can be reused before the first picture, or
-through pictures whose positions, span lengths and pixel hashes match. Changing a picture keeps only the prefix before
-it. Each parallel conversation keeps its own picture identities. Slots store these identities with the model state,
-not the picture embeddings. The image-aware slot format replaces older slots; the first request after upgrading reads
-those conversations again.
+The DeepSeek C++ path keeps conversation history in the same RAM and directory slots. `STRATA_DS4_CONTEXT_HISTORY=images`
+(the default) allows several whole pictures to be omitted anywhere in the submitted history, not just at the start, and
+short caption or marker changes (up to 256 old text tokens skipped per edit). `fragments` also allows arbitrarily long old
+text or multimodal fragments to be omitted. Both modes tolerate short replacement or inserted history text of up to 256
+tokens. Matching uses exact 8-text-token chunks, picture identities as independent anchors, or a complete shorter tail
+block, preferring strong anchors and the earliest cached position; there is no fixed 32-token tail requirement.
+`0` requires strict prefix matching. An explicitly set new variable overrides the old `STRATA_DS4_IMAGE_HISTORY=0` switch;
+otherwise that switch still disables image-history retention. Unknown values fall back to strict matching, and
+`STRATA_DS4_REUSE=0` always disables reuse.
+
+This retains a conversation when a client stops sending old history or collapses it in the display; it does not make the
+model forget. The full evaluated causal KV state is retained, and hidden content still counts against the context limit.
+Short replacement or inserted history text is treated as a display annotation, not reevaluated at past model positions;
+the new suffix is still read normally. For actual deletion, rewriting, summary replacement or changed instructions that
+must affect the model, use strict matching and reread the affected suffix. KV state is never relocated or spliced into
+incompatible state. Ambiguity, no alignable block or insufficient capacity falls back to strict prefix matching or an
+existing checkpoint. These retention modes make no GPU compatibility or measured speedup claim.
+
+Each parallel conversation keeps its own picture identities. Slots store these identities with the model state, not the
+picture embeddings. The image-aware slot format replaces older slots; the first request after upgrading reads those
+conversations again.
 
 ## Several conversations at once (`--parallel`)
 
