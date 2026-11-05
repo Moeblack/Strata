@@ -8,11 +8,11 @@
 //
 // --serve speaks what serve/server.py's StrataEngine expects: INFO lines, then `READY <context> stop`; per request
 // `GEN <max_new> [key=value ...] <id,id,...>` answered by `T <id>` lines and `DONE <generated> <prompt> <prompt ms>
-// <decode ms> <stop|length|cancel> 0 0 <reused> 0 0`; `STOP` ends a request early, `QUIT` the engine.  A prompt that
-// continues the state (the conversation so far) reuses it; one that only shares the last prompt's start goes back to
-// that prompt's end; anything else starts over.  `GENI <max_new> [keys] <file> <ids>` carries the prompt's pictures
-// (the file: see read_pics). A prompt that goes on from the conversation's latest answer takes the whole conversation
-// as it is, whatever the client pruned or rewrote before it (old pictures, reasoning), and reads only its new tail.
+// <decode ms> <stop|length|cancel> 0 0 <reused> 0 0`; `STOP` ends a request early, `QUIT` the engine. Prompts align
+// with the state by reserved role tokens (ds4_turns.hpp). The capacity-aware planner (ds4_plan.hpp) keeps the
+// whole live state or rewinds exactly to a feasible checkpoint; arbitrary message edits never authorize reuse of a
+// later matching answer. `GENI <max_new> [keys] <file> <ids>` carries the prompt's pictures (the file: see read_pics).
+// Complete omitted pictures/reasoning can stay cached, but still count against both memory and position budgets.
 // STRATA_DS4_SLOT_KEEP=1 the conversations are kept when another one takes the model (a slot each: the state, the
 // compressed KV included), and across runs in STRATA_DS4_SLOT_DIR - so a request that does not continue the state but
 // does continue a kept conversation reads only its new tokens.
@@ -38,7 +38,7 @@
 #include "ds4_packinfo.hpp"
 #include "ds4_slotmeta.hpp"
 #include "ds4_context_history.hpp"
-#include "ds4_continuation.hpp"
+#include "ds4_plan.hpp"
 #include "ds4_prefix_index.hpp"
 
 #include <algorithm>
@@ -60,6 +60,7 @@
 #include <cstring>
 #include <deque>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -549,6 +550,22 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     strata::ds4::TailCost tail_cost;
     SpanCache spans;
     const int img_tok = m.image_token();
+    const strata::ds4::TurnTokens turn_tokens{128803, 128804, 128799, 128821, 128822, img_tok};
+    // Native positions and allocated KV are separate limits. Older DS4 packs do
+    // not state the former; this architecture's native limit is 1,048,576.
+    const int64_t position_budget = [&]() {
+        int64_t limit = 1048576;
+        std::ifstream config(pack + "/ds4.txt");
+        std::string row;
+        while (std::getline(config, row)) {
+            std::istringstream fields(row);
+            std::string key;
+            int64_t value = 0;
+            if (fields >> key >> value && key == "max_position_embeddings" && value > 0)
+                limit = value;
+        }
+        return limit;
+    }();
     // Automatic cold reuse follows live history reuse. Only compact endpoint
     // fingerprints and branch keys stay resident for disk snapshots.
     const auto env_num = [](const char* k, double d) { const char* v = std::getenv(k); return v ? std::atof(v) : d; };
@@ -1114,17 +1131,15 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     const auto extend_history = [&]() {
         current_history().extend(m.tokens(), m.image_spans(), img_tok);
     };
-    // The bound live conversation taken whole: its KV stays exactly as it is, however the client pruned
-    // or rewrote earlier turns, and the request's input after the state's latest output is appended.
-    // Valid only when it covers more of the request than `floor` and the result fits the context.
-    const auto live_continuation = [&](const Req& r, size_t floor) {
-        const auto& st = m.tokens();
-        if (!reuse || st.empty() || r.max_new > m.max_context()) return strata::ds4::Continuation{};
-        const auto k = strata::ds4::find_continuation(st, r.ids, img_tok);
-        const int64_t budget = m.max_context() - std::max(0LL, r.max_new);
-        if (!k.valid() || k.request_from() <= floor ||
-            (int64_t) (st.size() + (r.ids.size() - k.request_from())) > budget) return strata::ds4::Continuation{};
-        return k;
+    const auto live_plan = [&](const Req& r, const std::vector<strata::ds4::ImageSpan>& images) {
+        if (!reuse) {
+            strata::ds4::CachePlan plan{strata::ds4::PlanKind::Overflow, 0, 0, r.ids.size()};
+            if (strata::ds4::cache_fits(0, r.ids.size(), 0, std::max(0LL, r.max_new),
+                                      m.max_context(), position_budget)) plan.kind = strata::ds4::PlanKind::Fresh;
+            return plan;
+        }
+        return strata::ds4::plan_cache(m.tokens(), r.ids, m.check_positions(), std::max(0LL, r.max_new),
+                                       m.max_context(), position_budget, m.image_spans(), images, turn_tokens);
     };
     // a request's prompt into the bound conversation (one conversation's requests and --parallel's alike): its
     // pictures read, the state it continues reused (in place, a checkpoint, or a kept conversation), the rest read.
@@ -1139,9 +1154,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         bool pictures_ready = false;
         std::vector<Pic> pics;
         strata::ds4::ContextHistoryIndex request_index;
-        strata::ds4::Continuation continuation;   // (valid: the live state taken whole, the request's tail appended)
-        size_t request_tokens = 0;   // immutable wire length, before the continuation's rewrite
-        size_t request_pos(size_t pos) const { return std::min(request_tokens, continuation.to_request(pos)); }
+        strata::ds4::CachePlan plan;   // immutable request/model boundary mapping after a reuse
+        size_t request_tokens = 0;
+        size_t request_pos(size_t pos) const { return std::min(request_tokens, plan.to_request(pos)); }
         std::vector<strata::ds4::MarkAt> cuts;   // the restore points the read stops at (ds4_marks.hpp)
         size_t next_cut = 0;                     // (the next of them)
         int64_t tail_at = -1;                    // (the tail point the read keeps, TailCost)
@@ -1186,20 +1201,20 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         P.pictures_ready = true;
         return true;
     };
-    // Commit a whole-history continuation of the bound state: the prompt becomes the live tokens plus
-    // the request's new tail, pictures before the continuation point are already part of the state.
-    const auto continue_whole = [&](Req& r, std::vector<strata::ds4::ImageSpan>& images, Prompt& P,
-                                    const strata::ds4::Continuation& k) -> bool {
+    // Materialize the selected model prefix plus R[q':]. For Rewind the engine
+    // has already restored exactly q, so old pictures beyond q disappear here.
+    const auto apply_plan = [&](Req& r, std::vector<strata::ds4::ImageSpan>& images, Prompt& P,
+                                const strata::ds4::CachePlan& k) -> bool {
         const auto& st = m.tokens();
-        if (!k.valid() || k.model_from() != st.size()) return false;
+        if (!k.reuses() || k.keep != st.size()) return false;
         std::vector<int> ids(st.begin(), st.end());
-        ids.insert(ids.end(), r.ids.begin() + (std::ptrdiff_t) k.request_from(), r.ids.end());
+        ids.insert(ids.end(), r.ids.begin() + (std::ptrdiff_t) k.request_from, r.ids.end());
         std::vector<strata::ds4::ImageSpan> spans;
         for (const auto& q : m.image_spans())
-            if ((size_t) q.start < st.size()) spans.push_back(q);
+            if (q.start >= 0 && (uint64_t) q.start + (uint64_t) q.len <= k.keep) spans.push_back(q);
         // Request positions inside the history the state already holds have no model position (-1).
         const auto shift = [&](long long at) -> long long {
-            return at >= 0 && (uint64_t) at >= k.request_from() ? (long long) k.to_model(at) : -1;
+            return at >= 0 && (uint64_t) at >= k.request_from ? (long long) k.to_model(at) : -1;
         };
         for (const Pic& q : P.pics)
             if (shift(q.start) >= 0) spans.push_back({shift(q.start), (int64_t) q.len, q.hash});
@@ -1217,13 +1232,13 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         r.tail = shift(r.tail);
         r.shared = shift(r.shared);
         if (r.pin >= 256) r.pin = std::max(0LL, shift(r.pin));
-        std::fprintf(stderr, "ds4: continued the live conversation whole: %zu cached tokens kept, %zu of %zu request "
-                             "tokens covered, %zu new to read\n",
-                     st.size(), k.request_from(), r.ids.size(), r.ids.size() - k.request_from());
+        std::fprintf(stderr, "ds4: %s: %zu cached tokens kept, %zu of %zu request tokens covered, %zu new to read\n",
+                     k.kind == strata::ds4::PlanKind::Whole ? "whole" : "rewind", k.keep, k.request_from,
+                     r.ids.size(), r.ids.size() - k.request_from);
         r.ids.swap(ids);
         images.swap(spans);
         P.pics.swap(pics);
-        P.continuation = k;
+        P.plan = k;
         return true;
     };
     // Begin the bound conversation, then read its prompt in pieces and keep its end checkpoints.
@@ -1232,57 +1247,43 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::vector<Pic>& pics = P.pics;
         std::vector<strata::ds4::ImageSpan> images;
         for (const Pic& q : pics) images.push_back({q.start, (int64_t) q.len, q.hash});
-        if (!reuse) {   // (STRATA_DS4_REUSE=0, for A/Bs and tests: every request is a fresh read of its whole prompt)
-            m.reset();
-            current_history().clear();
+        const auto plan = live_plan(r, images);
+        if (!plan.fits()) {
+            std::printf("ERR%s context_length_exceeded: prompt (%zu tokens) and max_new %lld exceed context %lld\n",
+                        tag.c_str(), r.ids.size(), r.max_new,
+                        (long long) std::min(m.max_context(), position_budget));
+            std::fflush(stdout);
+            return false; // rejection never mutates a live conversation
         }
-        const auto& st = m.tokens();
-        const size_t n_state = st.size();
-        size_t c = current_history().common_prefix(P.request_index);
-        // Fingerprints select candidates; only the chosen live prefix is checked
-        // against actual token and image identities before its KV is reused.
-        c = (size_t) strata::ds4::image_prefix(m.image_spans(), images, (int64_t) c);
-        if (!std::equal(st.begin(), st.begin() + c, r.ids.begin())) c = 0;
         size_t from = 0;
-        bool continued = false;   // the conversation goes on - its anchor stays
-        // A complete live continuation wins without touching cold storage.
-        if (n_state > 0 && c == n_state && n_state < r.ids.size()) {
-            from = n_state;
+        bool continued = false;
+        if (plan.kind == strata::ds4::PlanKind::Whole) {
+            // No checkpoint, synchronization, serialization or cold lookup.
+            if (!apply_plan(r, images, P, plan)) {
+                std::printf("ERR%s invalid live cache boundary\n", tag.c_str());
+                std::fflush(stdout);
+                return false;
+            }
+            from = plan.keep;
             continued = true;
-        }
-        else {
-            // The live conversation is taken whole whenever the request goes on from its latest output,
-            // whatever the client pruned or rewrote before it. Only a miss consults restore points and
-            // the compact cold prefix index.
-            const size_t floor = (size_t) std::max<int64_t>(0,
-                m.restorable((int64_t) std::min(c, r.ids.size() - 1)));
-            if (continue_whole(r, images, P, live_continuation(r, floor))) {
-                from = n_state;
-                continued = true;
+        } else {
+            bool whole = false;
+            if (reuse) from = cold_take(r.ids, P.request_index, images, plan.request_from, whole);
+            if (from > 0) {
+                continued = whole;
+                current_history().clear();
+            } else if (plan.kind == strata::ds4::PlanKind::Rewind &&
+                       m.restore((int64_t) plan.keep) && m.pos() == (int64_t) plan.keep &&
+                       apply_plan(r, images, P, plan)) {
+                from = plan.keep;
             } else {
-                bool whole = false;
-                if (reuse) from = cold_take(r.ids, P.request_index, images, floor, whole);
-                if (from > 0) {
-                    continued = whole;
-                    current_history().clear();
-                } else {
-                    const int64_t limit = (int64_t) std::min(c, r.ids.size() - 1);
-                    if (m.restorable(limit) > 0 && m.restore(limit)) from = (size_t) m.pos();
-                    else {
-                        if (reuse) slot_put("");
-                        m.reset();   // (nothing of the live state is this prompt's: it starts empty)
-                    }
-                }
+                if (reuse) slot_put("");
+                m.reset();
+                current_history().clear();
             }
         }
         // Restore/reset can shorten only the selected sequence's indexed prefix.
         extend_history();
-        if ((int64_t) r.ids.size() + std::max(0LL, r.max_new) > m.max_context()) {
-            std::printf("ERR%s the prompt (%zu tokens) and max_new %lld are more than the context %lld\n", tag.c_str(),
-                        r.ids.size(), r.max_new, (long long) m.max_context());
-            std::fflush(stdout);
-            return false;
-        }
         std::string err;
         bool ok = true;
         // the pictures whose spans the prompt reads (the rest the state holds): encoded (or the cache's), checked
@@ -1322,8 +1323,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             return false;   // (the state holds a complete conversation: kept for the next request)
         }
         m.set_image_spans(images);
-        // the restore points the request asks for (marks= / tail= / shared= / pin=N; ds4_marks.hpp picks the ones this
-        // read reaches, and leaves the prompt's last token to the usual end): the read stops at each and keeps the state
+        // Automatic semantic boundaries and explicit marks share one retention
+        // plan; the prompt's last token is left to the usual end checkpoint.
         const size_t total = r.ids.size();
         std::vector<strata::ds4::MarkAt>& cuts = P.cuts;
         cuts.clear();
@@ -1355,11 +1356,14 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 }
             }
             const long long shared = r.shared >= 0 ? r.shared : (r.pin >= 256 ? r.pin : -1);
-            if (!asked.empty() || shared >= 0) {
-                std::vector<std::pair<int64_t, int64_t>> spans;
-                for (const auto& q : images) spans.push_back({q.start, q.len});
-                cuts = strata::ds4::mark_plan(asked, shared, (int64_t) from, (int64_t) total, m.marks_cap(), 16, spans);
-            }
+            std::vector<int64_t> user_starts;
+            for (const auto& turn : strata::ds4::split_turns(r.ids, turn_tokens))
+                if (turn.role == strata::ds4::TurnRole::User) user_starts.push_back((int64_t) turn.begin);
+            const int64_t preamble_end = user_starts.empty() ? -1 : user_starts.front();
+            std::vector<std::pair<int64_t, int64_t>> image_ranges;
+            for (const auto& q : images) image_ranges.push_back({q.start, q.len});
+            cuts = strata::ds4::mark_plan(asked, shared, (int64_t) from, (int64_t) total,
+                                           m.marks_cap(), 16, image_ranges, user_starts, preamble_end);
         }
         // a STOP while the prompt is read ends it there (the engine's run of chunks at a layer or chunk, windows between
         // feeds, --parallel's between pieces) and goes back to the state before this prompt - kept here first, in
@@ -1990,11 +1994,13 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 in.forget(r.rid);
                 return;
             }
-            // the conversation: the idle one the prompt reuses the most of (its whole state continued - exactly, or
-            // taken whole past the client's edits - else a checkpoint it can go back to), else an empty one, else the
-            // least recently used
+            // The same capacity-aware solver scores every idle sequence. Cached
+            // token count alone overvalues histories full of elided pictures.
+            std::vector<strata::ds4::ImageSpan> request_images;
+            for (const Pic& q : a->P.pics) request_images.push_back({q.start, (int64_t) q.len, q.hash});
             int best = -1;
-            int64_t best_u = -1;
+            size_t best_cost = std::numeric_limits<size_t>::max();
+            bool best_whole = false;
             const auto prefer_idle = [&](int s, int previous) {
                 if (previous < 0) return true;
                 const bool empty = m.seq_tokens(s).empty();
@@ -2005,16 +2011,15 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             for (int s = 0; s < nseq; ++s) {
                 if (seq_rid[(size_t) s] >= 0) continue;
                 bind(s);
-                const auto& st = m.tokens();
-                const size_t c = current_history().common_prefix(a->P.request_index);
-                int64_t u = 0;
-                if (!st.empty() && c == st.size() && st.size() < r.ids.size()) u = (int64_t) st.size();
-                else {
-                    if (c > 0) u = std::max<int64_t>(0, m.restorable((int64_t) std::min(c, r.ids.size() - 1)));
-                    const auto whole = live_continuation(r, (size_t) u);
-                    if (whole.valid()) u = (int64_t) whole.request_from();
+                const auto plan = live_plan(r, request_images);
+                const auto cost = plan.cost();
+                const bool whole = plan.kind == strata::ds4::PlanKind::Whole;
+                if (best < 0 || cost < best_cost ||
+                    (cost == best_cost && (whole != best_whole ? whole : prefer_idle(s, best)))) {
+                    best = s;
+                    best_cost = cost;
+                    best_whole = whole;
                 }
-                if (best < 0 || u > best_u || (u == best_u && prefer_idle(s, best))) best = s, best_u = u;
             }
             if (best < 0) {   // (the server gives each conversation one request: a request over that waits)
                 waiting.push_front(ln);

@@ -145,12 +145,34 @@ on the card on a GPU that shares the PC's memory (Mac, GB10, Strix Halo), and wi
 tokens) and hands it to the engine; it needs Pillow for that (`python -m pip install pillow`; setup installs it). `--vision no` in `strata launch`
 (or `--vision off` for the engine) turns them off; a request with a picture then gets a 400 that says so.
 
-The DeepSeek C++ path takes a live conversation whole. When a request goes on from the conversation's latest answer,
-the engine keeps the conversation's entire state as it is and reads only what the request adds after that answer -
-whatever the client did to the earlier history: pruned old pictures, dropped reasoning, collapsed or rewrote turns.
-Those edits are not reconciled and do not make the model forget; the full state still counts against the context limit.
-A request that does not go on from the latest answer (a retry, an edit of the last message) goes back to the nearest
-restore point or a kept conversation instead, as before. A continuation that would not fit the context is read normally.
+The DeepSeek C++ cache aligns **turn topology**, using the reserved User, Assistant and System tokens rather than
+searching for a repeated answer suffix. `ds4_turns.hpp` classifies aligned history as `Same`, `Elided` or `Novel`.
+Identical text and retained picture identities are `Same`; complete cached pictures and assistant reasoning blocks
+omitted by the client are `Elided`. An edited message, a changed retained picture or a different role sequence is
+`Novel`: the cache never skips that edit to find a matching later answer. Elision does not make the model forget;
+cached-only tokens still occupy real KV positions.
+
+`ds4_plan.hpp` chooses among `Whole`, `Rewind`, `Fresh` and `Overflow`. For every restorable checkpoint it maps
+the retained model position `q` to the corresponding request position `q'`, and proves:
+
+```text
+q + (request_tokens - q') + max_new <= min(C_mem, B_pos)
+```
+
+`C_mem` is the allocated `--context` capacity. `B_pos` is the pack's `max_position_embeddings`, or the native
+1,048,576-position limit for older packs without that field. Every checkpoint is considered: the latest one can
+retain too many elided tokens even when an earlier one fits. The feasible plan with the least remaining prefill
+work wins, preferring `Whole` on a tie. `Whole` appends directly without checkpointing, serialization or cold
+storage access. `Rewind` restores exactly the selected checkpoint, drops pictures beyond it and reads `R[q':]`.
+When no live reuse is better, an independently verified exact-prefix cold slot can still supply the request's
+start; otherwise `Fresh` reads it normally. If no plan fits, the engine returns `context_length_exceeded` without
+changing the live conversation. Parallel admission uses the same `plan.cost()` (remaining prefill tokens), not
+the number of cached tokens.
+
+Prompt reads automatically request checkpoints at every new picture's start, every User turn's start and the end
+of the preamble before the first User (shared). These semantic boundaries are exact, never moved by the short-gap
+coalescing applied to optional `marks=` / `tail=` points. The existing restore-point cap still applies: shared
+starts are retained first, then the latest points. Explicit `shared=` / `pin=` and `marks=` remain supported.
 `STRATA_DS4_REUSE=0` turns all reuse off.
 
 Each parallel conversation keeps its own picture identities. Slots store these identities with the model state, not the
